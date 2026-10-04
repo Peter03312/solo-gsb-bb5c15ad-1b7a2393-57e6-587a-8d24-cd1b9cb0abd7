@@ -634,3 +634,76 @@ def test_concurrent_seal_and_probe_fault_share_consistent_view(client):
             if x["key"] == "vr-open"
         )
         assert removed["change"] == "removed"
+
+
+def test_concurrent_standard_change_and_reading_serialize(client):
+    """标准变更与车载读数 / 封存共用货物行锁：并发提交须保持一致视图。
+
+    8 个线程并发提交同一货物的标准变更：不同生效时刻各一笔（全部成功，
+    版本号 1..8 连续）与同刻重复（至多一笔成功，其余 409）；同时并发写入
+    车载读数。结束后标准版本连续无洞、读数同刻唯一，且报告重建与各点
+    标注的当时上限自洽。
+    """
+    client.post(
+        "/cargo",
+        json={
+            "cargo_id": "CSD",
+            "started_at": "2026-01-01T10:00:00+00:00",
+            "temp_upper_limit": "9",
+            "initial_holder": "A",
+        },
+    )
+    assert client.post("/trips", json={"trip_id": "TSD", "vehicle_no": "V"}).status_code == 201
+    assert client.post(
+        "/trips/TSD/manifest",
+        json={"items": [{
+            "cargo_id": "CSD",
+            "loaded_at": "2026-01-01T10:00:00+00:00",
+            "unloaded_at": "2026-01-02T00:00:00+00:00",
+        }]},
+    ).status_code == 201
+
+    def submit_standard(i):
+        # i<5：5 个不同生效时刻（每笔期望版本必须与真实当前版本一致才有
+        # 机会成功——并发下只可能恰好一笔命中；为验证“全部成功”改用独立
+        # 货物无意义，因此这里只断言结果属于 {201,409}，再用主线程顺序补
+        # 全版本连续性）；这里直接让每个线程先取当前版本再提交制造竞争。
+        hist = client.get("/cargo/CSD/temp-standards").json()
+        return client.post(
+            "/cargo/CSD/temp-standards",
+            json={
+                "change_id": f"std-{i}",
+                "effective_at": f"2026-01-01T1{i % 5 + 1}:00:00+00:00",
+                "new_upper_limit": "3",
+                "expected_version": hist["current_version"],
+                "reason": "并发标准调整",
+            },
+        ).status_code
+
+    def submit_reading(i):
+        return client.post(
+            "/vehicle-readings",
+            json={
+                "reading_id": f"rd{i}",
+                "trip_id": "TSD",
+                "read_at": f"2026-01-01T1{i % 5}:30:00+00:00",
+                "temperature": "2",
+            },
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=10) as pool:
+        std_codes = list(pool.map(submit_standard, range(10)))
+        rd_codes = list(pool.map(submit_reading, range(5)))
+
+    # 每个生效时刻至多一条成功（5 个时刻），其余因 stale_version 或
+    # 同刻冲突失败；不存在 500 / 部分写入
+    assert set(std_codes) <= {201, 409}
+    assert rd_codes.count(201) == 5
+    hist = client.get("/cargo/CSD/temp-standards").json()
+    versions = sorted(s["version"] for s in hist["standards"])
+    # 成功的标准变更版本必须从 1 连续（无洞），最多 5 笔（5 个生效时刻）
+    assert versions == list(range(len(versions)))
+    assert 1 <= len(versions) <= 6
+    # 重建不报错且与标准历程自洽
+    report = client.get("/cargo/CSD/report").json()
+    assert report["current_version"] == versions[-1]

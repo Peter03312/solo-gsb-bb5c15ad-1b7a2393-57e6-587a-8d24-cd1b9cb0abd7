@@ -56,6 +56,7 @@ def merged_timeline(
     event_effective: dict[str, tuple] | None = None,
     reading_effective: dict[str, tuple] | None = None,
     reading_quarantine: dict[str, tuple] | None = None,
+    standards: tuple = (),
 ) -> list[TimelinePoint]:
     """生成货物的完整读数时间线（含被取代 / 被隔离的车载点，按时间升序）。
 
@@ -71,10 +72,21 @@ def merged_timeline(
         重建；覆盖故障编号随点输出。隔离与“同刻自有测温优先”相互独立——
         同刻有自有测温的读数即使也被故障覆盖，仍标 ``quarantined=True``
         但 adopted 的首要原因是被自有测温取代。
+    :param standards: 货物完整温度标准历程
+        （:class:`app.standards.StandardEntry` 元组，含初始版本）。每个测温点
+        按“生效时刻 <= 读数时刻的最新一条”标注其**当时生效上限**
+        （左闭，边界读数取新上限）；为空时不标注（重建退化为初始上限）。
     """
     event_effective = event_effective or {}
     reading_effective = reading_effective or {}
     reading_quarantine = reading_quarantine or {}
+
+    def _limit_at(at):
+        if not standards:
+            return None
+        from app.standards import limit_at
+
+        return limit_at(standards, at)
 
     points: list[TimelinePoint] = []
     own_measure_at = set()
@@ -92,6 +104,17 @@ def merged_timeline(
                     source_id=e.event_id,
                     adopted=True,
                     temp_version=eff[1],
+                    temp_limit=_limit_at(e.occurred_at),
+                )
+            else:
+                p = TimelinePoint(
+                    occurred_at=p.occurred_at,
+                    is_measurement=True,
+                    temperature=Decimal(e.temperature),
+                    source=SOURCE_OWN,
+                    source_id=e.event_id,
+                    adopted=True,
+                    temp_limit=_limit_at(e.occurred_at),
                 )
         points.append(p)
 
@@ -119,6 +142,7 @@ def merged_timeline(
                 adopted=r.read_at not in own_measure_at and not covers,
                 temp_version=r_version,
                 quarantine_faults=covers,
+                temp_limit=_limit_at(r.read_at),
             )
         )
     points.sort(
@@ -139,6 +163,7 @@ def adopted_timeline(
     event_effective: dict[str, tuple] | None = None,
     reading_effective: dict[str, tuple] | None = None,
     reading_quarantine: dict[str, tuple] | None = None,
+    standards: tuple = (),
 ) -> list[TimelinePoint]:
     """只含被采用点的时间线，供保管链重建使用。"""
     return [
@@ -150,27 +175,36 @@ def adopted_timeline(
             event_effective,
             reading_effective,
             reading_quarantine,
+            standards,
         )
         if p.adopted
     ]
 
 
 def load_cargo_context(db, cargo_id: str):
-    """一次读齐货物的自有事件、装卸时段、相关车次车载读数、测温更正有效值与
-    生效探头故障隔离映射。
+    """一次读齐货物的自有事件、装卸时段、相关车次车载读数、测温更正有效值、
+    生效探头故障隔离映射与**完整温度标准历程**。
 
-    返回 ``(events, loadings, readings, effective, quarantine)``；
+    返回 ``(events, loadings, readings, effective, quarantine, standards)``；
     ``effective`` 为 ``(event_effective, reading_effective)`` 两个映射，键分别
     为自有测温事件ID与车载读数ID，值为 ``(有效温度, 当前版本)``，只含发生过
     更正的目标；``quarantine`` 为车载读数ID -> 覆盖该读数的生效故障编号元组
     （仅含被该读数所属车次生效故障覆盖的读数；是否在车由合并阶段按装卸时段
-    再判定）。
+    再判定）；``standards`` 为含初始版本的标准历程
+    （:class:`app.standards.StandardEntry` 元组，按生效时刻升序）。
     """
     from sqlalchemy import select
 
     from app import faults as faults_mod
-    from app.models import Event, Loading, TemperatureCorrection, Trip, VehicleReading
+    from app import standards as std_mod
+    from app.models import Cargo, Event, Loading, TemperatureCorrection, Trip, VehicleReading
     from app.timeutil import ensure_utc
+
+    cargo = db.get(Cargo, cargo_id)
+    if cargo is None:
+        from app.crud import ApiError
+
+        raise ApiError(404, "cargo_not_found", f"货物 {cargo_id} 不存在")
 
     events = list(
         db.scalars(
@@ -221,7 +255,11 @@ def load_cargo_context(db, cargo_id: str):
         },
         reading_ids={r.reading_id for r in readings},
     )
-    return events, loadings, readings, effective, quarantine
+
+    # 完整温度标准历程（含初始版本，按生效时刻升序；允许补录 / 预约）
+    cargo.started_at = ensure_utc(cargo.started_at)
+    standards = std_mod.load_series(db, cargo)
+    return events, loadings, readings, effective, quarantine, standards
 
 
 def load_effective_maps(db, event_ids=None, reading_ids=None):

@@ -133,7 +133,7 @@ def request_fingerprint(cargo_id: str, interval_key: str, snapshot_id: str) -> s
 # ----------------------------------------------------------- 证据归集
 
 
-def _own_event_item(e, event_effective: dict) -> dict:
+def _own_event_item(e, event_effective: dict, limit_for=None) -> dict:
     is_measurement = getattr(e.event_type, "name", e.event_type) == "measurement"
     eff = event_effective.get(e.event_id) if is_measurement else None
     return {
@@ -145,12 +145,18 @@ def _own_event_item(e, event_effective: dict) -> dict:
             temp(eff[0]) if eff is not None else (temp(e.temperature) if is_measurement else None)
         ),
         "version": eff[1] if eff is not None else 0,
+        # 该测温时刻当时生效的温度上限（标准分时生效；交接恒为 null）
+        "temp_upper_limit": (
+            temp(limit_for(e.occurred_at))
+            if is_measurement and limit_for is not None
+            else None
+        ),
         "giver": e.giver,
         "receiver": e.receiver,
     }
 
 
-def _reading_item(r, reading_effective: dict, adopted: bool, covers=()) -> dict:
+def _reading_item(r, reading_effective: dict, adopted: bool, covers=(), limit_for=None) -> dict:
     eff = reading_effective.get(r.reading_id)
     covers = tuple(covers or ())
     return {
@@ -162,6 +168,10 @@ def _reading_item(r, reading_effective: dict, adopted: bool, covers=()) -> dict:
             temp(eff[0]) if eff is not None else temp(r.temperature)
         ),
         "version": eff[1] if eff is not None else 0,
+        # 该读数时刻对本货物当时生效的温度上限（标准分时生效，左闭取新）
+        "temp_upper_limit": (
+            temp(limit_for(r.read_at)) if limit_for is not None else None
+        ),
         "adopted": adopted,
         # 封存时是否被生效探头故障隔离；隔离读数不参与越温重建（adopted 恒为
         # false），但原始读数、有效温度 / 版本与覆盖故障编号随包封存留痕，
@@ -191,6 +201,7 @@ def scoped_evidence(
     span_end,
     apply_window_filter: bool = True,
     reading_quarantine: dict | None = None,
+    standards: tuple = (),
 ):
     """按时间范围归集重建证据（封存与现况对照共用同一定义）。
 
@@ -206,11 +217,21 @@ def scoped_evidence(
         ``quarantined=true``），但**仍是适用读数，照常计入证据集**并附
         覆盖故障编号，使封存包可核对隔离依据；封存后才登记故障时，旧读数
         在对照中因当前侧带隔离标记而按“封存后隔离”语义记为 ``removed``。
+    :param standards: 货物完整温度标准历程（含初始版本）。每条测温 / 读数
+        证据附其时刻**当时采用的上限**（左闭，边界读数取新上限）；为空时
+        不附上限（旧口径）。
     :returns: ``(own_event_items, reading_items, loading_items)`` 规范化字典，
         分别按 事件ID / (读数时刻, 读数ID) / (车次, 原装车时刻) 升序。
     """
     event_effective, reading_effective = effective
     reading_quarantine = reading_quarantine or {}
+
+    def _limit_for(at):
+        if not standards:
+            return None
+        from app.standards import limit_at
+
+        return limit_at(standards, at)
 
     lower = ensure_utc(start_bound) if start_bound is not None else None
 
@@ -223,7 +244,7 @@ def scoped_evidence(
             continue
         if apply_window_filter and lower is not None and at < lower:
             continue
-        own_items.append(_own_event_item(e, event_effective))
+        own_items.append(_own_event_item(e, event_effective, _limit_for))
     own_items.sort(key=lambda x: x["event_id"])
 
     own_measure_at = {
@@ -254,7 +275,7 @@ def scoped_evidence(
         covers = tuple(reading_quarantine.get(r.reading_id, ()))
         adopted = read_at not in own_measure_at and not covers
         reading_items.append(
-            _reading_item(r, reading_effective, adopted, covers)
+            _reading_item(r, reading_effective, adopted, covers, _limit_for)
         )
     reading_items.sort(key=lambda x: (x["read_at"], x["reading_id"]))
 
@@ -307,6 +328,17 @@ def _interval_dict(ex) -> dict:
     }
 
 
+def _standard_item(entry) -> dict:
+    """标准历程中的一个版本（初始版本或一次变更）的规范化字典。"""
+    return {
+        "version": int(entry.version),
+        "effective_at": ts(entry.effective_at),
+        "temp_upper_limit": temp(entry.temp_upper_limit),
+        "change_id": entry.change_id,
+        "reason": entry.reason,
+    }
+
+
 @dataclass(frozen=True)
 class SealPayload:
     """封存组装结果：规范化封存包（含摘要）与摘要（落库 / 回执用）。"""
@@ -329,6 +361,7 @@ def build_seal_payload(
     effective,
     sealed_at,
     reading_quarantine: dict | None = None,
+    standards: tuple = (),
 ) -> SealPayload:
     """在一个一致的已提交视图上组装封存包并计算内容摘要。
 
@@ -339,6 +372,8 @@ def build_seal_payload(
     :param reading_quarantine: 车载读数ID -> 生效探头故障编号元组；
         被覆盖的读数不参与重建（adopted=false / quarantined=true），但仍
         计入封存证据并附覆盖故障编号，供核对隔离依据。
+    :param standards: 货物完整温度标准历程（含初始版本）：封存包纳入完整
+        标准历程，且每条测温 / 读数证据记录其时刻当时采用的上限。
     """
     start, end = ensure_utc(ex.start), ensure_utc(ex.end)
     # 封存自有事件取“不晚于闭合时刻”的全部事件（含开启前完整保管链，
@@ -352,6 +387,7 @@ def build_seal_payload(
         end,
         apply_window_filter=False,
         reading_quarantine=reading_quarantine,
+        standards=standards,
     )
 
     sealed_at_s = ts(sealed_at)
@@ -361,6 +397,7 @@ def build_seal_payload(
         "cargo": {
             "cargo_id": cargo.cargo_id,
             "started_at": ts(cargo.started_at),
+            # 初始上限（版本 0，自货物起始时刻生效；完整历程见 temp_standards）
             "temp_upper_limit": temp(cargo.temp_upper_limit),
             "initial_holder": cargo.initial_holder,
         },
@@ -372,6 +409,9 @@ def build_seal_payload(
         "own_events": own_items,
         "vehicle_readings": reading_items,
         "loading_windows": loading_items,
+        # 封存时的完整温度标准历程（初始版本 + 历次变更，按生效时刻升序）；
+        # append-only，封存后新变更绝不改写本包，只在现况对照中体现差异。
+        "temp_standards": [_standard_item(e) for e in standards],
     }
     canonical = canonical_json(content)
     content_with_digest = dict(content)
@@ -403,16 +443,17 @@ class CurrentState:
     loadings: list
     effective: tuple
     quarantine: dict                 # 车载读数ID -> 生效探头故障编号元组
+    standards: tuple = ()            # 当前完整温度标准历程（含初始版本）
 
 
 def rebuild_current(db, cargo, interval_key: str) -> CurrentState:
     """按当前数据重建目标区间状态（读事务内调用；不抛 404/422）。"""
-    events, loadings, readings, effective, quarantine = (
+    events, loadings, readings, effective, quarantine, standards = (
         timeline.load_cargo_context(db, cargo.cargo_id)
     )
     cargo_start = ensure_utc(cargo.started_at)
     chain_result, closed = resp.rebuild(
-        cargo, events, loadings, readings, effective, quarantine
+        cargo, events, loadings, readings, effective, quarantine, standards
     )
     ex = closed.get(interval_key)
     open_ex = next(
@@ -429,6 +470,7 @@ def rebuild_current(db, cargo, interval_key: str) -> CurrentState:
         loadings=loadings,
         effective=effective,
         quarantine=quarantine,
+        standards=standards,
     )
     if ex is not None:
         rows = stance_crud.load_interval_stances(
@@ -465,6 +507,61 @@ def rebuild_current(db, cargo, interval_key: str) -> CurrentState:
 # ----------------------------------------------------------- 现况对照
 
 
+def _measurement_evidence_diff(
+    sealed_items: list[dict],
+    current_items: list[dict],
+    key: str,
+    default_limit,
+):
+    """测温类证据（自有测温 / 车载读数）逐项比对。
+
+    既有封存包可能没有每条证据的 ``temp_upper_limit`` 字段（标准分时生效
+    本轮新增）：比较前对封存侧缺失值按“初始上限”补齐——旧包封存时标准
+    历程只有版本 0，任何时刻的当时上限都等于初始上限；交接项恒为 null。
+    这样标准变化引起的差异呈现为该证据项 ``changed``（字段
+    ``temp_upper_limit``），既有封存包的其它对照语义完全不变。
+
+    ``default_limit`` 为量化后的初始上限字符串；为 None 时不补齐（理论不
+    发生：封存包 cargo.temp_upper_limit 恒有值）。
+    """
+    def _norm(item: dict) -> dict:
+        if "temp_upper_limit" in item:
+            return item
+        is_measurement = item.get("event_type", "measurement") != "handover"
+        return {
+            **item,
+            "temp_upper_limit": default_limit if is_measurement else None,
+        }
+
+    sealed_map = {item[key]: _norm(item) for item in sealed_items}
+    current_map = {item[key]: _norm(item) for item in current_items}
+    diffs = []
+    for k in sorted(set(sealed_map) | set(current_map)):
+        old = sealed_map.get(k)
+        new = current_map.get(k)
+        if old is None:
+            diffs.append({"key": k, "change": ITEM_ADDED,
+                          "sealed": None, "current": current_map[k]})
+        elif new is None:
+            diffs.append({"key": k, "change": ITEM_REMOVED,
+                          "sealed": sealed_map[k], "current": None})
+        elif old != new:
+            changed_fields = sorted(
+                {f for f in set(old) | set(new) if old.get(f) != new.get(f)}
+            )
+            diffs.append(
+                {
+                    "key": k,
+                    "change": ITEM_CHANGED,
+                    "fields": changed_fields,
+                    # 输出仍给原始封存项（旧包不被凭空补出字段）
+                    "sealed": next(i for i in sealed_items if i[key] == k),
+                    "current": next(i for i in current_items if i[key] == k),
+                }
+            )
+    return diffs
+
+
 def _evidence_diff(sealed_items: list[dict], current_items: list[dict], key: str):
     """按键归集的证据项逐项比对：added / removed / changed（含变更字段）。"""
     sealed_map = {item[key]: item for item in sealed_items}
@@ -491,7 +588,11 @@ def _evidence_diff(sealed_items: list[dict], current_items: list[dict], key: str
     return diffs
 
 
-def _vehicle_reading_diff(sealed_items: list[dict], current_items: list[dict]):
+def _vehicle_reading_diff(
+    sealed_items: list[dict],
+    current_items: list[dict],
+    default_limit=None,
+):
     """车载读数证据项对照（键 ``reading_id``），在通用增删变更之上叠加
     探头故障隔离语义：
 
@@ -502,16 +603,24 @@ def _vehicle_reading_diff(sealed_items: list[dict], current_items: list[dict]):
       covering_fault_ids 变化；同刻自有测温仍优先时 adopted 保持 false）；
     * **封存时已隔离、当前仍隔离**：覆盖故障集合变化（重叠故障撤销一条后
       仍被另一条覆盖）记为 ``changed``（covering_fault_ids），否则无差异；
-    * 其余（适用性消失、温度更正等）按通用 added / removed / changed 处理。
+    * 其余（适用性消失、温度更正、**标准变化引起的当时上限变化**）按通用
+      added / removed / changed 处理。
 
     旧封存包的读数项没有 ``quarantined`` / ``covering_fault_ids`` 字段，
-    比较前按缺省值（false / 空）归一化，保证旧包对照语义完全不变。
+    比较前按缺省值（false / 空）归一化，保证旧包对照语义完全不变；
+    ``temp_upper_limit`` 缺失（标准分时生效本轮新增）按初始上限补齐，
+    使标准变化呈现为 ``changed``（字段 temp_upper_limit）。
     """
     def _norm(item: dict) -> dict:
         return {
             **item,
             "quarantined": bool(item.get("quarantined", False)),
             "covering_fault_ids": list(item.get("covering_fault_ids", [])),
+            "temp_upper_limit": (
+                item["temp_upper_limit"]
+                if "temp_upper_limit" in item
+                else default_limit
+            ),
         }
 
     # 归一化副本仅用于字段比较；diff 输出的 sealed / current 仍为原始项
@@ -600,7 +709,40 @@ def _current_evidence(state: CurrentState, start_bound, span_end):
         span_end,
         apply_window_filter=False,
         reading_quarantine=state.quarantine,
+        standards=state.standards,
     )
+
+
+def _temp_standard_diff(sealed_standards: list[dict] | None, current_standards: list[dict]):
+    """标准历程对照：以版本号（提交序号）为稳定键，逐项 added / removed /
+    changed（标准 append-only，正常只有 added）。
+
+    旧封存包无 ``temp_standards`` 段时按“仅有初始版本（版本 0）”解释：
+    初始版本内容取自封存包 cargo 段（起始时刻 + 初始上限），变更项全部
+    表现为 added——完整呈现标准变化，且绝不改写原包。
+    """
+    if sealed_standards is None:
+        sealed_standards = []
+
+    sealed_map = {int(s["version"]): s for s in sealed_standards}
+    current_map = {int(s["version"]): s for s in current_standards}
+    diffs = []
+    for v in sorted(set(sealed_map) | set(current_map)):
+        old = sealed_map.get(v)
+        new = current_map.get(v)
+        if old is None:
+            diffs.append({"key": str(v), "change": ITEM_ADDED,
+                          "sealed": None, "current": new})
+        elif new is None:
+            diffs.append({"key": str(v), "change": ITEM_REMOVED,
+                          "sealed": old, "current": None})
+        elif old != new:
+            changed_fields = sorted(
+                {f for f in set(old) | set(new) if old.get(f) != new.get(f)}
+            )
+            diffs.append({"key": str(v), "change": ITEM_CHANGED,
+                          "fields": changed_fields, "sealed": old, "current": new})
+    return diffs
 
 
 def build_diff(content: dict, state: CurrentState, now_ub) -> dict:
@@ -613,6 +755,22 @@ def build_diff(content: dict, state: CurrentState, now_ub) -> dict:
     """
     sealed_interval = content["interval"]
     sealed_segments = sealed_interval["segments"]
+
+    # 旧封存包（标准分时生效本轮之前）没有 temp_standards 段：按“仅有初始
+    # 版本”解释，初始版本取自封存包 cargo 段；新包直接使用封存历程。
+    sealed_standards = content.get("temp_standards")
+    if sealed_standards is None:
+        sealed_standards = [
+            {
+                "version": 0,
+                "effective_at": content["cargo"]["started_at"],
+                "temp_upper_limit": content["cargo"]["temp_upper_limit"],
+                "change_id": None,
+                "reason": None,
+            }
+        ]
+    default_limit = content["cargo"]["temp_upper_limit"]
+    current_standards = [_standard_item(e) for e in state.standards]
 
     if state.status == STATUS_UNCHANGED:
         ex = state.current_ex
@@ -659,16 +817,23 @@ def build_diff(content: dict, state: CurrentState, now_ub) -> dict:
         "current_interval": current_interval,
         "segment_changes": _segment_diff(sealed_segments, current_segments),
         "evidence_changes": {
-            "own_events": _evidence_diff(
-                content["own_events"], own_now, "event_id"
+            "own_events": _measurement_evidence_diff(
+                content["own_events"], own_now, "event_id", default_limit
             ),
             "vehicle_readings": _vehicle_reading_diff(
-                content["vehicle_readings"], read_now
+                content["vehicle_readings"], read_now, default_limit
             ),
             "loading_windows": _loading_window_diff(
                 content["loading_windows"], load_now
             ),
         },
+        # 完整温度标准历程的现况与增 / 删 / 变更（append-only，标准变化只
+        # 影响对照结果，绝不改写封存原包；旧包按“仅初始版本”对照）
+        "sealed_temp_standards": sealed_standards,
+        "current_temp_standards": current_standards,
+        "temp_standard_changes": _temp_standard_diff(
+            content.get("temp_standards"), current_standards
+        ),
     }
 
 

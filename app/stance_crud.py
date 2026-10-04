@@ -45,11 +45,11 @@ def _unprocessable(message: str, code: str) -> ApiError:
 
 def _rebuild_closed(db, cargo):
     """持锁/读事务内在合并读数时间线上重建，返回 (chain结果, 闭合区间映射)。"""
-    events, loadings, readings, effective, quarantine = load_cargo_context(
-        db, cargo.cargo_id
+    events, loadings, readings, effective, quarantine, standards = (
+        load_cargo_context(db, cargo.cargo_id)
     )
     return resp.rebuild(
-        cargo, events, loadings, readings, effective, quarantine
+        cargo, events, loadings, readings, effective, quarantine, standards
     )
 
 

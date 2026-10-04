@@ -559,6 +559,82 @@ class ProbeFaultRevocation(Base):
     fault: Mapped["ProbeFault"] = relationship(back_populates="revocation")
 
 
+class TempStandardChange(Base):
+    """货物温度上限分时生效变更（append-only：只追加，不修改不删除）。
+
+    质控人员凭**变更编号** ``change_id`` 提交一笔带时区生效时刻
+    ``effective_at`` 的新温度上限，初始上限仍存于
+    :attr:`Cargo.temp_upper_limit`，作为**版本 0** 自货物起始时刻
+    ``started_at`` 生效；本表每行是一次标准变更，``version`` 为提交序号
+    （首次变更为 1，乐观锁：提交时 ``expected_version`` 必须等于当前已提交
+    变更数）。
+
+    上限按**左闭右开**的阶梯函数分时生效：一笔在 t 时刻已采用的测温读数
+    越温与否，取“生效时刻 <= t 的最新一条标准”的上限——恰在生效时刻的
+    读数采用新上限。允许补录（生效时刻早于提交时间）与预约（晚于提交
+    时间）；同一货物同一生效时刻至多一条变更（且不得等于货物起始时刻，
+    该时刻属于初始版本），生效时刻早于货物起始时刻一律拒绝。变更本身
+    不产生任何测温或交接事件。
+
+    全部重建（货物时间线、越温报告、责任确认、车次同时越温）按各已采用
+    读数当时的上限进行；装卸预检在标准变更时刻把分析时段二次分段，预检
+    摘要绑定完整标准历程。
+    """
+
+    __tablename__ = "temp_standard_change"
+    __table_args__ = (
+        CheckConstraint(
+            "expected_version >= 0 AND version >= 1 "
+            "AND new_upper_limit IS NOT NULL "
+            "AND reason IS NOT NULL AND char_length(reason) > 0",
+            name="chk_temp_standard_change_shape",
+        ),
+        # 同一货物下版本号唯一（应用侧在货物行锁内按提交序号分配）
+        Index(
+            "ux_temp_standard_cargo_version",
+            "cargo_id",
+            "version",
+            unique=True,
+        ),
+        # 同一货物同一生效时刻至多一条变更（初始版本占据货物起始时刻，
+        # 该时刻的变更由应用侧拒绝）
+        Index(
+            "ux_temp_standard_cargo_effective_at",
+            "cargo_id",
+            "effective_at",
+            unique=True,
+        ),
+        Index(
+            "ix_temp_standard_cargo_time",
+            "cargo_id",
+            "effective_at",
+        ),
+    )
+
+    change_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    cargo_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("cargo.cargo_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    effective_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    new_upper_limit: Mapped[Decimal] = mapped_column(
+        Numeric(10, 3), nullable=False
+    )
+    # 乐观锁：提交时该货物的当前标准版本（已提交变更数，首次为 0）；
+    # 本次变更后的版本（= expected_version + 1，即提交序号）
+    expected_version: Mapped[int] = mapped_column(nullable=False)
+    version: Mapped[int] = mapped_column(nullable=False)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
 class EvidenceSeal(Base):
     """责任证据封存包（append-only，封存内容此后不可改）。
 

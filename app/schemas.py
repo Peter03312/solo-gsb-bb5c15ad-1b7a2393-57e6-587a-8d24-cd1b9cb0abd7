@@ -48,9 +48,128 @@ class CargoOut(BaseModel):
 
     cargo_id: str
     started_at: datetime
-    temp_upper_limit: Decimal
+    # 初始温度上限（标准版本 0，自货物起始时刻生效；分时标准见温度标准历程接口）
+    temp_upper_limit: Decimal = Field(
+        ...,
+        description="初始温度上限（标准版本 0，自货物起始时刻生效）；"
+        "温度标准变更不改本字段，分时历程见 GET /cargo/{id}/temp-standards",
+    )
     initial_holder: str
     created_at: datetime
+
+
+# ----------------------------------------------------- 货物温度上限分时标准
+
+
+class TempStandardChangeCreate(BaseModel):
+    """货物温度上限分时生效变更提交（append-only，只追加不改写）。
+
+    货物编号取自路径；变更须给出带时区的生效时刻、新上限、期望标准版本
+    （首次为 0，取标准历程查询中的 ``current_version``）与原因。初始上限
+    自货物起始时刻生效，允许补录（生效时刻早于提交时间）与预约（晚于提交
+    时间）；同一生效时刻至多一条变更，且不得早于 / 等于货物起始时刻。
+    """
+
+    change_id: str = Field(
+        ..., min_length=1, max_length=64, description="变更编号（客户端指定）"
+    )
+    effective_at: datetime = Field(
+        ...,
+        description="新上限生效时刻（含；须显式携带时区偏移）。"
+        "允许补录（早于当前时间）与预约（晚于当前时间）",
+    )
+    new_upper_limit: Decimal = Field(..., description="新生效温度上限（摄氏度）")
+    expected_version: int = Field(
+        ...,
+        ge=0,
+        description="期望的货物当前标准版本（已提交变更数；首次为 0）；"
+        "不一致则拒绝（stale_version）",
+    )
+    reason: str = Field(
+        ..., min_length=1, max_length=512, description="变更原因（必填非空）"
+    )
+
+    @field_validator("reason")
+    @classmethod
+    def _reason_not_blank(cls, value: str) -> str:
+        if not value or not value.strip():
+            raise ValueError("标准变更原因 reason 不能为空白")
+        return value.strip()
+
+
+class TempStandardEntryOut(BaseModel):
+    """标准历程中的一个生效版本（初始版本或一次变更）。"""
+
+    version: int = Field(
+        ...,
+        description="标准版本：0=初始上限（自货物起始时刻生效）；"
+        "n>=1 为第 n 次提交的变更（按提交序号）",
+    )
+    effective_at: datetime = Field(
+        ..., description="该版本上限的生效时刻（含，UTC）"
+    )
+    temp_upper_limit: Decimal = Field(..., description="该版本的温度上限")
+    change_id: str | None = Field(
+        ..., description="变更编号；初始版本恒为 null"
+    )
+    reason: str | None = Field(..., description="变更原因；初始版本恒为 null")
+
+
+class TempStandardChangeOut(BaseModel):
+    """一条温度标准变更记录（append-only）。"""
+
+    change_id: str
+    cargo_id: str
+    effective_at: datetime
+    new_upper_limit: Decimal
+    expected_version: int
+    version: int = Field(..., description="本次变更后的标准版本（= expected_version + 1）")
+    reason: str
+    created_at: datetime
+
+
+class TempStandardChangeAck(BaseModel):
+    """标准变更新写入回执：变更记录 + 变更后的当前标准版本与上限。"""
+
+    change: TempStandardChangeOut
+    version: int = Field(..., description="变更后的当前标准版本（已提交变更数）")
+    current_version: int = Field(
+        ..., description="同 version：当前标准版本（下一次变更的 expected_version）"
+    )
+    new_upper_limit: Decimal = Field(..., description="本次变更的新上限")
+
+
+class TempStandardChangeReplay(BaseModel):
+    """同变更编号同请求重传：返回原结果（幂等）。"""
+
+    replayed: bool = True
+    change: TempStandardChangeOut
+    version: int
+    current_version: int
+    new_upper_limit: Decimal
+    message: str
+
+
+class TempStandardHistory(BaseModel):
+    """一票货物的完整温度标准历程与当前版本。"""
+
+    cargo_id: str
+    started_at: datetime = Field(..., description="货物起始时刻（初始版本生效起点，含）")
+    initial_temp_upper_limit: Decimal = Field(
+        ..., description="初始温度上限（cargo.temp_upper_limit，版本 0）"
+    )
+    current_version: int = Field(
+        ...,
+        description="当前标准版本（已提交变更数；乐观锁 expected_version 取此值）",
+    )
+    current_temp_upper_limit: Decimal = Field(
+        ..., description="当前时刻生效的温度上限（预约版本尚未生效时不计）"
+    )
+    standards: list[TempStandardEntryOut] = Field(
+        ...,
+        description="完整标准历程（初始版本 + 历次变更，按生效时刻升序；"
+        "补录 / 预约使版本号在序列中可能倒序）",
+    )
 
 
 class EventOut(BaseModel):
@@ -121,7 +240,15 @@ class Excursion(BaseModel):
 
 class ChainReport(BaseModel):
     cargo_id: str
-    temp_upper_limit: Decimal
+    temp_upper_limit: Decimal = Field(
+        ...,
+        description="初始温度上限（标准版本 0）；各越温区间按其读数当时的"
+        "分时上限重建，完整历程见 GET /cargo/{id}/temp-standards",
+    )
+    current_temp_upper_limit: Decimal = Field(
+        ..., description="当前时刻生效的温度上限（预约版本尚未生效时不计）"
+    )
+    current_version: int = Field(..., description="当前标准版本（已提交变更数）")
     current_holder: str = Field(..., description="按事件重建出的当前保管方")
     excursions: list[Excursion]
 
@@ -551,8 +678,14 @@ class ReadingApplication(BaseModel):
     )
     over_limit: bool | None = Field(
         ...,
-        description="按该货物自身温度上限是否越温（按当前有效温度判定，"
-        "仅供查阅）；不在车上时为 null。被故障隔离的读数仍给出其温度判定",
+        description="按该货物在**读数时刻当时生效的温度上限**是否越温"
+        "（温度标准分时生效，按当前有效温度判定，仅供查阅）；"
+        "不在车上时为 null。被故障隔离的读数仍给出其温度判定",
+    )
+    temp_upper_limit: Decimal | None = Field(
+        default=None,
+        description="该货物在读数时刻当时生效的温度上限（边界读数取新上限）；"
+        "不在车上时为 null",
     )
     quarantined: bool = Field(
         ...,
@@ -648,6 +781,11 @@ class TimelinePointOut(BaseModel):
     temperature: Decimal | None = Field(
         ...,
         description="测温点的**当前有效温度**（含更正）；交接为 null",
+    )
+    temp_upper_limit: Decimal | None = Field(
+        default=None,
+        description="该测温时刻**当时生效的温度上限**（温度标准分时生效："
+        "取生效时刻 <= 读数时刻的最新版本，边界读数取新上限）；交接为 null",
     )
     version: int = Field(
         ...,
@@ -1054,8 +1192,22 @@ class SealCargo(BaseModel):
 
     cargo_id: str
     started_at: datetime
-    temp_upper_limit: Decimal
+    temp_upper_limit: Decimal = Field(
+        ...,
+        description="初始温度上限（版本 0，自货物起始时刻生效）；完整分时"
+        "历程见 EvidenceSealContent.temp_standards",
+    )
     initial_holder: str
+
+
+class SealTempStandard(BaseModel):
+    """封存标准历程中的一个生效版本（初始版本或一次变更）。"""
+
+    version: int
+    effective_at: datetime
+    temp_upper_limit: Decimal
+    change_id: str | None = Field(..., description="变更编号；初始版本为 null")
+    reason: str | None = Field(..., description="变更原因；初始版本为 null")
 
 
 class SealSegment(BaseModel):
@@ -1095,6 +1247,11 @@ class SealOwnEvent(BaseModel):
         ..., description="封存时当前有效温度（含更正）；交接为 null"
     )
     version: int = Field(..., description="封存时测温更正版本（0=原始值）")
+    temp_upper_limit: Decimal | None = Field(
+        default=None,
+        description="该测温时刻当时采用的温度上限（标准分时生效，边界取新）；"
+        "交接为 null；标准分时功能之前封存的旧包无此字段（对照时按初始上限解释）",
+    )
     giver: str | None = None
     receiver: str | None = None
 
@@ -1110,6 +1267,11 @@ class SealVehicleReading(BaseModel):
         ..., description="封存时当前有效温度（含更正）"
     )
     version: int = Field(..., description="封存时更正版本（0=原始值）")
+    temp_upper_limit: Decimal | None = Field(
+        default=None,
+        description="该读数时刻对本货物当时采用的温度上限（标准分时生效，"
+        "边界取新）；标准分时功能之前封存的旧包无此字段（对照时按初始上限解释）",
+    )
     adopted: bool = Field(
         ...,
         description="封存时该读数是否被本货物采用：同刻有自有测温时为 false"
@@ -1185,6 +1347,13 @@ class EvidenceSealContent(BaseModel):
     )
     loading_windows: list[SealLoadingWindow] = Field(
         ..., description="重建该区间所用的当前装卸窗口及窗口版本"
+    )
+    temp_standards: list[SealTempStandard] = Field(
+        default_factory=list,
+        description="封存时货物的完整温度标准历程（初始版本 + 历次变更，"
+        "按生效时刻升序）；封存 append-only，此后标准变化不改写本字段，"
+        "只在现况对照中体现。标准分时功能之前封存的旧包无此字段（对照时"
+        "按“仅有初始版本”解释）",
     )
     content_digest: str = Field(
         ..., description="封存内容摘要：sha256:<hex>（对规范化封存内容取摘要）"
@@ -1266,5 +1435,20 @@ class SealDiffReport(BaseModel):
     evidence_changes: dict = Field(
         ...,
         description="证据项变更：{own_events, vehicle_readings, loading_windows} "
-        "各为 SealDiffItem 列表（按键排序）",
+        "各为 SealDiffItem 列表（按键排序）。温度标准变化会使读数当时的上限"
+        "变化：对应测温 / 读数项记为 changed（字段 temp_upper_limit）",
+    )
+    sealed_temp_standards: list[SealTempStandard] = Field(
+        default_factory=list,
+        description="封存时的完整温度标准历程；旧封存包无此时按“仅有初始版本”给出",
+    )
+    current_temp_standards: list[SealTempStandard] = Field(
+        default_factory=list,
+        description="当前完整温度标准历程（初始版本 + 全部已提交变更，"
+        "含补录 / 预约；按生效时刻升序）",
+    )
+    temp_standard_changes: list[SealDiffItem] = Field(
+        default_factory=list,
+        description="温度标准历程的增 / 删 / 变更（以版本号为键；标准 append-only，"
+        "正常表现为后续版本 added——封存后提交的标准变更）",
     )

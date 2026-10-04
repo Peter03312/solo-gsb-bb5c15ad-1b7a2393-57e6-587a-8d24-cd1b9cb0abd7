@@ -915,3 +915,151 @@ import json,sys
 d = json.load(sys.stdin)
 r = next(x for x in d["content"]["vehicle_readings"] if x["reading_id"] == "sq-vr-q")
 print("    原包不改: quarantined =", r["quarantined"], "covering =", r["covering_fault_ids"])'
+
+echo
+echo "================ 本轮新增：货物温度上限分时生效标准 ================"
+SC=C-STD
+STT=T-STD
+echo "73) 创建演示货物：起始 2026-10-10 08:00（+08:00），初始上限 5℃（版本 0）"
+curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$SC\",
+  \"started_at\": \"2026-10-10T08:00:00+08:00\",
+  \"temp_upper_limit\": \"5\",
+  \"initial_holder\": \"质检冷库\"
+}" | python3 -c 'import json,sys; print("   ", json.load(sys.stdin))'
+
+echo "74) 查询完整标准历程与当前版本（初始：仅版本 0，current_version=0）"
+curl -sS "$BASE/cargo/$SC/temp-standards" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+print("    current_version =", d["current_version"],
+      "current_temp_upper_limit =", d["current_temp_upper_limit"])
+for s in d["standards"]:
+    print("    v", s["version"], s["effective_at"], s["temp_upper_limit"], s["change_id"])'
+
+echo "75) 提交标准变更 ch-std-1：10-10 12:00（+08:00）起上限 3℃，期望版本 0（允许补录/预约）"
+curl -sS -X POST "$BASE/cargo/$SC/temp-standards" -H 'Content-Type: application/json' -d '{
+  "change_id": "ch-std-1",
+  "effective_at": "2026-10-10T12:00:00+08:00",
+  "new_upper_limit": "3",
+  "expected_version": 0,
+  "reason": "气象预警，午间收紧温控标准"
+}' | python3 -c 'import json,sys; d=json.load(sys.stdin); print("    version =", d["version"], d["change"]["effective_at"], d["new_upper_limit"])'
+
+echo "76) 同编号同请求重传 -> 200 replayed（返回原结果，不重复落库）"
+curl -sS -X POST "$BASE/cargo/$SC/temp-standards" -H 'Content-Type: application/json' -d '{
+  "change_id": "ch-std-1",
+  "effective_at": "2026-10-10T12:00:00+08:00",
+  "new_upper_limit": "3",
+  "expected_version": 0,
+  "reason": "气象预警，午间收紧温控标准"
+}' | python3 -c 'import json,sys; print("    replayed =", json.load(sys.stdin)["replayed"])'
+
+echo "    异内容（上限改成 2）-> 409 change_id_conflict；期望版本过期（再带 0）-> 409 stale_version"
+curl -sS -o /dev/null -w "    异内容 HTTP %{http_code}\n" -X POST "$BASE/cargo/$SC/temp-standards" \
+  -H 'Content-Type: application/json' -d '{
+  "change_id": "ch-std-1", "effective_at": "2026-10-10T12:00:00+08:00",
+  "new_upper_limit": "2", "expected_version": 0, "reason": "x"}'
+curl -sS -o /dev/null -w "    版本过期 HTTP %{http_code}\n" -X POST "$BASE/cargo/$SC/temp-standards" \
+  -H 'Content-Type: application/json' -d '{
+  "change_id": "ch-std-2", "effective_at": "2026-10-10T14:00:00+08:00",
+  "new_upper_limit": "4", "expected_version": 0, "reason": "x"}'
+echo "    生效时刻早于货物起始 / 等于起始时刻 -> 422"
+curl -sS -o /dev/null -w "    早于起始 HTTP %{http_code}\n" -X POST "$BASE/cargo/$SC/temp-standards" \
+  -H 'Content-Type: application/json' -d '{
+  "change_id": "ch-std-e", "effective_at": "2026-10-10T07:00:00+08:00",
+  "new_upper_limit": "2", "expected_version": 1, "reason": "x"}'
+echo "    同刻冲突 -> 409（同货物同一生效时刻仅一条）"
+curl -sS -o /dev/null -w "    同刻冲突 HTTP %{http_code}\n" -X POST "$BASE/cargo/$SC/temp-standards" \
+  -H 'Content-Type: application/json' -d '{
+  "change_id": "ch-std-3", "effective_at": "2026-10-10T12:00:00+08:00",
+  "new_upper_limit": "2", "expected_version": 1, "reason": "x"}'
+
+echo "77) 边界读数取新上限：11:00 读数 4℃（旧上限 5 不越温）；恰在 12:00 读数 4℃（新上限 3 越温）；13:00 读数 2℃ 闭合"
+for body in \
+  '{"event_id":"sc-m0","cargo_id":"C-STD","occurred_at":"2026-10-10T11:00:00+08:00","temperature":"4"}' \
+  '{"event_id":"sc-m1","cargo_id":"C-STD","occurred_at":"2026-10-10T12:00:00+08:00","temperature":"4"}' \
+  '{"event_id":"sc-m2","cargo_id":"C-STD","occurred_at":"2026-10-10T13:00:00+08:00","temperature":"2"}'; do
+  curl -sS -o /dev/null -X POST "$BASE/events" -H 'Content-Type: application/json' -d "$body"
+done
+curl -sS "$BASE/cargo/$SC/report" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+print("    current_version =", d["current_version"],
+      "current_temp_upper_limit =", d["current_temp_upper_limit"])
+for ex in d["excursions"]:
+    print("    区间", ex["start"], "->", ex["end"], "开启事件 =", ex["interval_id"])'
+curl -sS "$BASE/cargo/$SC/timeline" | python3 -c '
+import json,sys
+for p in json.load(sys.stdin)["points"]:
+    print("    时间线", p["occurred_at"], "temp =", p["temperature"],
+          "当时上限 =", p["temp_upper_limit"])'
+
+echo "78) 装卸预检在标准变更时刻分段：登记车次并挂上 $SC 的装卸窗口 + 两笔车载读数"
+curl -sS -o /dev/null -X POST "$BASE/trips" -H 'Content-Type: application/json' \
+  -d "{\"trip_id\": \"$STT\", \"vehicle_no\": \"京STD\"}"
+curl -sS -o /dev/null -X POST "$BASE/trips/$STT/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [{\"cargo_id\": \"$SC\",
+    \"loaded_at\": \"2026-10-10T10:00:00+08:00\",
+    \"unloaded_at\": \"2026-10-10T18:00:00+08:00\"}]}"
+for body in \
+  '{"reading_id":"sc-r1","trip_id":"T-STD","read_at":"2026-10-10T11:30:00+08:00","temperature":"4"}' \
+  '{"reading_id":"sc-r2","trip_id":"T-STD","read_at":"2026-10-10T12:30:00+08:00","temperature":"4"}'; do
+  curl -sS -o /dev/null -X POST "$BASE/vehicle-readings" -H 'Content-Type: application/json' -d "$body"
+done
+curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d '{
+  "cargo_id": "C-STD-NEW", "started_at": "2026-10-10T08:00:00+08:00",
+  "temp_upper_limit": "5", "initial_holder": "质检冷库"}' >/dev/null
+REV=$(curl -sS "$BASE/trips/$STT" | python3 -c 'import json,sys; print(json.load(sys.stdin)["revision"])')
+curl -sS -X POST "$BASE/trips/$STT/manifest/precheck" -H 'Content-Type: application/json' -d "{
+  \"expected_trip_revision\": $REV,
+  \"items\": [{\"cargo_id\": \"C-STD-NEW\",
+    \"loaded_at\": \"2026-10-10T10:00:00+08:00\",
+    \"unloaded_at\": \"2026-10-10T18:00:00+08:00\"}]}" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+print("    分段（货物集合不变也在标准变更时刻 12:00 切开）：")
+for s in d["segments"]:
+    print("     ", s["start"][11:16], "-", s["end"][11:16],
+          "上限 min/max =", s["temp_limit_min"], s["temp_limit_max"],
+          "风险数 =", len(s["risks"]))
+print("    digest =", d["digest"])'
+
+echo "79) 新封存包记录各证据读数采用的上限与完整标准历程；封存后再变更，原包不变、对照呈现差异"
+SC2=C-STD2
+curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$SC2\", \"started_at\": \"2026-10-10T08:00:00+08:00\",
+  \"temp_upper_limit\": \"5\", \"initial_holder\": \"质检冷库\"}" >/dev/null
+for body in \
+  '{"event_id":"sc2-m1","cargo_id":"C-STD2","occurred_at":"2026-10-10T11:00:00+08:00","temperature":"8"}' \
+  '{"event_id":"sc2-m2","cargo_id":"C-STD2","occurred_at":"2026-10-10T12:00:00+08:00","temperature":"2"}'; do
+  curl -sS -o /dev/null -X POST "$BASE/events" -H 'Content-Type: application/json' -d "$body"
+done
+SC2SNAP=$(curl -sS "$BASE/cargo/$SC2/responsibilities" \
+  | python3 -c 'import json,sys; print(json.load(sys.stdin)["intervals"][0]["snapshot_id"])')
+curl -sS -X POST "$BASE/evidence-seals" -H 'Content-Type: application/json' -d "{
+  \"case_id\": \"CASE-STD-1\", \"cargo_id\": \"$SC2\",
+  \"interval_id\": \"sc2-m1\", \"snapshot_id\": \"$SC2SNAP\"}" | python3 -c '
+import json,sys
+c = json.load(sys.stdin)["content"]
+print("    封存标准历程版本 =", [s["version"] for s in c["temp_standards"]])
+print("    各证据当时上限 =",
+      {e["event_id"]: e["temp_upper_limit"] for e in c["own_events"] if e["event_type"]=="measurement"})'
+echo "    封存后补录更严标准（10:30 起 3℃）："
+curl -sS -o /dev/null -X POST "$BASE/cargo/$SC2/temp-standards" -H 'Content-Type: application/json' -d '{
+  "change_id": "ch-sc2-1", "effective_at": "2026-10-10T10:30:00+08:00",
+  "new_upper_limit": "3", "expected_version": 0, "reason": "封存后补录"}'
+curl -sS "$BASE/evidence-seals/CASE-STD-1/diff" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+print("    区间状态 =", d["status"])
+print("    标准历程变更 =", [(c["key"], c["change"], c["current"]["change_id"])
+                         for c in d["temp_standard_changes"]])
+print("    测温证据上限差异 =",
+      {c["key"]: (c["sealed"]["temp_upper_limit"], "->", c["current"]["temp_upper_limit"])
+       for c in d["evidence_changes"]["own_events"] if c["change"]=="changed"})'
+curl -sS "$BASE/evidence-seals/CASE-STD-1" | python3 -c '
+import json,sys
+c = json.load(sys.stdin)["content"]
+print("    原封存包不变：标准版本 =", [s["version"] for s in c["temp_standards"]],
+      "m1 上限 =", next(e["temp_upper_limit"] for e in c["own_events"] if e["event_id"]=="sc2-m1"))'

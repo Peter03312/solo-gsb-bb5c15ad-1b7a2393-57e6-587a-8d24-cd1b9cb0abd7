@@ -848,6 +848,194 @@ def main() -> None:
         print("封存原包不改：quarantined =", old["quarantined"],
               "covering =", old["covering_fault_ids"])
 
+        # ================ 本轮新增：货物温度上限分时生效标准 ================
+        sc = "C-STD-PY"
+        show(
+            "创建分时标准演示货物（初始上限 5℃）",
+            api.post(
+                "/cargo",
+                json={
+                    "cargo_id": sc,
+                    "started_at": "2026-10-10T08:00:00+08:00",
+                    "temp_upper_limit": "5",
+                    "initial_holder": "质检冷库",
+                },
+            ),
+        )
+        show(
+            "初始标准历程（仅版本 0）",
+            api.get(f"/cargo/{sc}/temp-standards"),
+        )
+        # 12:00（+08:00）起上限收紧为 3℃，期望版本 0；允许补录 / 预约
+        show(
+            "提交标准变更 ch-py-1（2026-10-10 12:00 +08:00 起 3℃）",
+            api.post(
+                f"/cargo/{sc}/temp-standards",
+                json={
+                    "change_id": "ch-py-1",
+                    "effective_at": "2026-10-10T12:00:00+08:00",
+                    "new_upper_limit": "3",
+                    "expected_version": 0,
+                    "reason": "气象预警，午间收紧温控标准",
+                },
+            ),
+        )
+        # 同编号同请求重传 -> 200 replayed
+        show(
+            "同请求重传（幂等）",
+            api.post(
+                f"/cargo/{sc}/temp-standards",
+                json={
+                    "change_id": "ch-py-1",
+                    "effective_at": "2026-10-10T12:00:00+08:00",
+                    "new_upper_limit": "3",
+                    "expected_version": 0,
+                    "reason": "气象预警，午间收紧温控标准",
+                },
+            ),
+        )
+        show(
+            "完整标准历程与当前版本",
+            api.get(f"/cargo/{sc}/temp-standards"),
+        )
+        # 边界读数取新上限：11:00 的 4℃ 在旧上限下不越温；恰在 12:00 的
+        # 4℃ 在新上限 3℃ 下越温；13:00 的 2℃ 闭合
+        for eid, at, temp in [
+            ("py-sc-m0", "2026-10-10T11:00:00+08:00", "4"),
+            ("py-sc-m1", "2026-10-10T12:00:00+08:00", "4"),
+            ("py-sc-m2", "2026-10-10T13:00:00+08:00", "2"),
+        ]:
+            api.post(
+                "/events",
+                json={
+                    "event_id": eid, "cargo_id": sc,
+                    "occurred_at": at, "temperature": temp,
+                },
+            )
+        report = api.get(f"/cargo/{sc}/report").json()
+        print(
+            "\n== 越温按各读数当时上限重建 =="
+        )
+        print(
+            "    current_version =", report["current_version"],
+            "current_temp_upper_limit =", report["current_temp_upper_limit"],
+        )
+        for ex in report["excursions"]:
+            print("    区间", ex["start"], "->", ex["end"], "开启 =", ex["interval_id"])
+        for p_ in api.get(f"/cargo/{sc}/timeline").json()["points"]:
+            print(
+                "    时间线", p_["occurred_at"], "temp =", p_["temperature"],
+                "当时上限 =", p_["temp_upper_limit"],
+            )
+
+        # 装卸预检在标准变更时刻分段
+        api.post("/trips", json={"trip_id": "T-STD-PY", "vehicle_no": "京STD"})
+        api.post(
+            "/trips/T-STD-PY/manifest",
+            json={"items": [{
+                "cargo_id": sc,
+                "loaded_at": "2026-10-10T10:00:00+08:00",
+                "unloaded_at": "2026-10-10T18:00:00+08:00",
+            }]},
+        )
+        for rid, at in [
+            ("py-sc-r1", "2026-10-10T11:30:00+08:00"),
+            ("py-sc-r2", "2026-10-10T12:30:00+08:00"),
+        ]:
+            api.post(
+                "/vehicle-readings",
+                json={"reading_id": rid, "trip_id": "T-STD-PY",
+                      "read_at": at, "temperature": "4"},
+            )
+        api.post(
+            "/cargo",
+            json={
+                "cargo_id": "C-STD-PY-NEW",
+                "started_at": "2026-10-10T08:00:00+08:00",
+                "temp_upper_limit": "5",
+                "initial_holder": "质检冷库",
+            },
+        )
+        rev = api.get("/trips/T-STD-PY").json()["revision"]
+        pre = api.post(
+            "/trips/T-STD-PY/manifest/precheck",
+            json={
+                "expected_trip_revision": rev,
+                "items": [{
+                    "cargo_id": "C-STD-PY-NEW",
+                    "loaded_at": "2026-10-10T10:00:00+08:00",
+                    "unloaded_at": "2026-10-10T18:00:00+08:00",
+                }],
+            },
+        ).json()
+        print("\n== 预检在标准变更时刻 12:00 分段 ==")
+        for seg in pre["segments"]:
+            print(
+                "   ", seg["start"][11:16], "-", seg["end"][11:16],
+                "上限 min/max =", seg["temp_limit_min"], seg["temp_limit_max"],
+                "风险数 =", len(seg["risks"]),
+            )
+        print("    digest =", pre["digest"])
+
+        # 封存包记录各证据读数采用的上限与完整标准历程；封存后标准变化
+        # 不改原包，只在现况对照呈现差异
+        sc2 = "C-STD-PY-2"
+        api.post(
+            "/cargo",
+            json={
+                "cargo_id": sc2,
+                "started_at": "2026-10-10T08:00:00+08:00",
+                "temp_upper_limit": "5",
+                "initial_holder": "质检冷库",
+            },
+        )
+        api.post(
+            "/events",
+            json={"event_id": "py-sc2-m1", "cargo_id": sc2,
+                  "occurred_at": "2026-10-10T11:00:00+08:00",
+                  "temperature": "8"},
+        )
+        api.post(
+            "/events",
+            json={"event_id": "py-sc2-m2", "cargo_id": sc2,
+                  "occurred_at": "2026-10-10T12:00:00+08:00",
+                  "temperature": "2"},
+        )
+        snap = api.get(f"/cargo/{sc2}/responsibilities").json()["intervals"][0]["snapshot_id"]
+        seal = api.post(
+            "/evidence-seals",
+            json={"case_id": "CASE-STD-PY-1", "cargo_id": sc2,
+                  "interval_id": "py-sc2-m1", "snapshot_id": snap},
+        ).json()
+        print("\n== 新封存包 ==")
+        print("    标准历程版本 =",
+              [x["version"] for x in seal["content"]["temp_standards"]])
+        print("    各证据当时上限 =",
+              {e["event_id"]: e["temp_upper_limit"]
+               for e in seal["content"]["own_events"]
+               if e["event_type"] == "measurement"})
+        api.post(
+            f"/cargo/{sc2}/temp-standards",
+            json={
+                "change_id": "ch-py-sc2-1",
+                "effective_at": "2026-10-10T10:30:00+08:00",
+                "new_upper_limit": "3",
+                "expected_version": 0,
+                "reason": "封存后补录更严标准",
+            },
+        )
+        diff = api.get("/evidence-seals/CASE-STD-PY-1/diff").json()
+        print("\n== 封存后标准变化的现况对照 ==")
+        print("    区间状态 =", diff["status"])
+        print("    标准历程变更 =",
+              [(c["key"], c["change"], c["current"]["change_id"])
+               for c in diff["temp_standard_changes"]])
+        print("    测温证据上限差异 =",
+              {c["key"]: (c["sealed"]["temp_upper_limit"],
+                          c["current"]["temp_upper_limit"])
+               for c in diff["evidence_changes"]["own_events"]
+               if c["change"] == "changed"})
+
 
 if __name__ == "__main__":
     main()

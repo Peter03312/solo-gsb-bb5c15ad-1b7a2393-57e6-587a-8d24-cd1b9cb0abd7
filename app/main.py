@@ -4,7 +4,7 @@
 一键启动    : docker compose up --build  （见 README）
 """
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from fastapi import Depends, FastAPI, Request
@@ -22,6 +22,8 @@ from app import (
     probe_fault_crud,
     responsibility,
     sealing,
+    standard_crud,
+    standards as std_mod,
     stance_crud,
     timeline,
     vehicle_crud,
@@ -34,6 +36,7 @@ from app.models import (
     ProbeFault,
     Stance,
     StanceKind,
+    TempStandardChange,
     Trip,
     VehicleReading,
 )
@@ -99,6 +102,12 @@ from app.schemas import (
     StanceOut,
     StanceReplay,
     StanceSegment,
+    TempStandardChangeAck,
+    TempStandardChangeCreate,
+    TempStandardChangeOut,
+    TempStandardChangeReplay,
+    TempStandardEntryOut,
+    TempStandardHistory,
     TimelinePointOut,
     TripCreate,
     TripDetail,
@@ -269,6 +278,44 @@ async def lifespan(app: FastAPI):
                 )
                 """
             )
+            # 6) 货物温度上限分时生效标准变更表（新表，IF NOT EXISTS 兜底；
+            #    append-only：初始上限仍存 cargo.temp_upper_limit，版本 0
+            #    自货物起始时刻生效）
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS temp_standard_change (
+                    change_id        VARCHAR(64)   PRIMARY KEY,
+                    cargo_id         VARCHAR(64)   NOT NULL
+                                   REFERENCES cargo(cargo_id) ON DELETE RESTRICT,
+                    effective_at     TIMESTAMPTZ   NOT NULL,
+                    new_upper_limit  NUMERIC(10,3) NOT NULL,
+                    expected_version INTEGER       NOT NULL,
+                    version          INTEGER       NOT NULL,
+                    reason           VARCHAR(512)  NOT NULL,
+                    created_at       TIMESTAMPTZ   NOT NULL DEFAULT now(),
+                    CONSTRAINT chk_temp_standard_change_shape CHECK (
+                        expected_version >= 0
+                        AND version >= 1
+                        AND new_upper_limit IS NOT NULL
+                        AND char_length(reason) > 0
+                    )
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ux_temp_standard_cargo_version "
+                "ON temp_standard_change (cargo_id, version)"
+            )
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS "
+                "ux_temp_standard_cargo_effective_at "
+                "ON temp_standard_change (cargo_id, effective_at)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_temp_standard_cargo_time "
+                "ON temp_standard_change (cargo_id, effective_at)"
+            )
     yield
 
 
@@ -298,8 +345,16 @@ app = FastAPI(
         "越温报告、责任确认与同时越温随之重算，旧表态历史与封存原包保持"
         "原样，封存现况对照反映变化；写入与相关装卸/读数/更正/表态串行，"
         "成功推进车次修订号使旧预检摘要失效。"
+        "质控人员可按货物登记温度上限的分时生效标准：凭变更编号提交带时区"
+        "生效时刻、新上限、期望标准版本与原因（初始上限即版本 0，自货物"
+        "起始时刻生效；允许补录与预约，同刻仅一条，边界读数采用新上限，"
+        "变更本身不产生测温或交接）。时间线、越温报告、责任确认与车次同时"
+        "越温按每笔已采用读数当时的上限重建；装卸预检在标准变更时刻分段"
+        "分析且预检摘要绑定完整标准历程（确认时过期拒绝）；新封存包记录"
+        "各证据读数采用的上限与完整标准历程，既有封存包与摘要不变、现况"
+        "对照呈现标准变化引起的差异。"
     ),
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -332,6 +387,123 @@ def get_cargo(cargo_id: str, db: Session = Depends(get_db)) -> Cargo:
     if cargo is None:
         raise crud.ApiError(404, "cargo_not_found", f"货物 {cargo_id} 不存在")
     return cargo
+
+
+# ----------------------------------------------------- 货物温度上限分时标准
+
+
+def _standard_entry_out(entry) -> TempStandardEntryOut:
+    return TempStandardEntryOut(
+        version=entry.version,
+        effective_at=ensure_utc(entry.effective_at),
+        temp_upper_limit=Decimal(entry.temp_upper_limit),
+        change_id=entry.change_id,
+        reason=entry.reason,
+    )
+
+
+def _standard_change_out(row: TempStandardChange) -> TempStandardChangeOut:
+    return TempStandardChangeOut(
+        change_id=row.change_id,
+        cargo_id=row.cargo_id,
+        effective_at=ensure_utc(row.effective_at),
+        new_upper_limit=Decimal(row.new_upper_limit),
+        expected_version=row.expected_version,
+        version=row.version,
+        reason=row.reason,
+        created_at=ensure_utc(row.created_at),
+    )
+
+
+@app.post(
+    "/cargo/{cargo_id}/temp-standards",
+    response_model=TempStandardChangeAck,
+    status_code=201,
+    tags=["货物温度分时标准"],
+    responses={
+        200: {
+            "model": TempStandardChangeReplay,
+            "description": "同变更编号同请求重传：返回原结果（幂等）",
+        },
+        404: {"description": "货物不存在"},
+        409: {"description": "期望版本过期 / 变更编号异内容冲突 / 同刻冲突"},
+        422: {"description": "生效时刻早于 / 等于货物起始时刻 / 缺时区 / 原因为空"},
+    },
+)
+def submit_temp_standard_change(
+    cargo_id: str,
+    payload: TempStandardChangeCreate,
+    db: Session = Depends(get_db),
+):
+    """提交一笔货物温度上限分时生效变更（append-only，不修改初始字段）。
+
+    初始上限为标准版本 0、自货物起始时刻生效（``cargo.temp_upper_limit``
+    语义不变）。请求给出**带时区生效时刻**、新上限、**期望标准版本**
+    （首次为 0，取 ``GET /cargo/{id}/temp-standards`` 的 ``current_version``）
+    与原因。允许补录（生效时刻早于当前时间）与预约（晚于当前时间）；
+    同一生效时刻至多一条变更且不得早于 / 等于货物起始时刻（后者属于初始
+    版本）。越温判定为左闭阶梯：**恰在生效时刻的读数采用新上限**；变更
+    本身不产生任何测温或交接。同编号同请求重传返回原结果；异内容、版本
+    过期、时刻非法或同刻冲突一律拒绝且不留部分写入。与该货物的读数 /
+    装卸 / 封存等写入经货物行锁保持一致视图。
+    """
+    value = payload.effective_at
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise crud.ApiError(
+            422,
+            "timezone_required",
+            "字段 effective_at 必须携带时区偏移（如 2026-10-04T09:00:00+08:00）",
+        )
+    payload.effective_at = ensure_utc(payload.effective_at)
+    result = standard_crud.submit_change(db, cargo_id, payload)
+    ack = TempStandardChangeAck(
+        change=_standard_change_out(result.change),
+        version=result.version,
+        current_version=result.version,
+        new_upper_limit=Decimal(result.new_upper_limit),
+    )
+    if result.replayed:
+        return JSONResponse(
+            status_code=200,
+            content=TempStandardChangeReplay(
+                **ack.model_dump(mode="json"),
+                message="相同请求的温度标准变更已存在，重传返回原结果（幂等）",
+            ).model_dump(mode="json"),
+        )
+    return ack
+
+
+@app.get(
+    "/cargo/{cargo_id}/temp-standards",
+    response_model=TempStandardHistory,
+    tags=["货物温度分时标准"],
+    responses={404: {"description": "货物不存在"}},
+)
+def get_temp_standards(
+    cargo_id: str, db: Session = Depends(get_db)
+) -> TempStandardHistory:
+    """货物温度标准的**完整历程与当前版本**。
+
+    返回初始版本（版本 0，自货物起始时刻生效，上限即
+    ``cargo.temp_upper_limit``）与全部已提交变更，按**生效时刻**升序
+    （补录 / 预约使版本号在序列中可能倒序）；``current_version`` 为已提交
+    变更数（下一次变更的 ``expected_version``），``current_temp_upper_limit``
+    为当前时刻生效上限（预约版本尚未生效时不计）。
+    """
+    cargo = _load_cargo(db, cargo_id)
+    series, _changes, current_version = standard_crud.get_standard_history(
+        db, cargo
+    )
+    now = datetime.now(timezone.utc)
+    current_entry = std_mod.current_entry(series, now)
+    return TempStandardHistory(
+        cargo_id=cargo.cargo_id,
+        started_at=cargo.started_at,
+        initial_temp_upper_limit=Decimal(cargo.temp_upper_limit),
+        current_version=current_version,
+        current_temp_upper_limit=Decimal(current_entry.temp_upper_limit),
+        standards=[_standard_entry_out(e) for e in series],
+    )
 
 
 # ---------------------------------------------------------------- 事件
@@ -664,7 +836,8 @@ def _excursion_schema(ex) -> Excursion:
 
 
 def _trip_reading_application(
-    db, reading: VehicleReading, loadings, cargos, reading_eff, reading_quarantine
+    db, reading: VehicleReading, loadings, cargos, reading_eff, reading_quarantine,
+    cargo_standards=None,
 ):
     """一笔车载读数对车次上各票货物的适用性/采用情况。"""
     apps = []
@@ -700,6 +873,7 @@ def _trip_reading_application(
         # 同刻自有优先：被取代与被故障隔离同时成立时，首要原因标记为被自有取代
         adopted = bool(on_board and not own_at.get(cargo_id) and not covers)
         over = None
+        applied_limit = None
         reason = "adopted"
         if not on_board:
             reason = "not_on_board"
@@ -708,13 +882,20 @@ def _trip_reading_application(
         elif covers:
             reason = "quarantined"
         if on_board:
-            over = eff_temp > Decimal(cargos[cargo_id].temp_upper_limit)
+            # 按读数时刻该货物当时生效的温度上限判定（标准分时，边界取新）
+            series = (cargo_standards or {}).get(cargo_id)
+            if series is not None:
+                applied_limit = std_mod.limit_at(series, read_at)
+            else:
+                applied_limit = Decimal(cargos[cargo_id].temp_upper_limit)
+            over = eff_temp > applied_limit
         apps.append(
             ReadingApplication(
                 cargo_id=cargo_id,
                 on_board=on_board,
                 adopted=adopted,
                 over_limit=over,
+                temp_upper_limit=applied_limit,
                 quarantined=quarantined,
                 covering_fault_ids=covers,
                 reason=reason,
@@ -785,10 +966,19 @@ def get_trip_detail(trip_id: str, db: Session = Depends(get_db)) -> TripDetail:
     )
     fault_rows = faults_mod.load_trip_faults(db, trip_id)
 
+    # 各货物在各读数时刻的当时上限（温度标准分时生效）
+    cargo_standards = {
+        cid: std_mod.build_series(
+            c, std_mod.load_standard_changes(db, cid)
+        )
+        for cid, c in cargos.items()
+    }
+
     trip_readings = []
     for r in readings:
         apps = _trip_reading_application(
-            db, r, loadings, cargos, reading_eff, reading_quarantine
+            db, r, loadings, cargos, reading_eff, reading_quarantine,
+            cargo_standards,
         )
         covers = list(reading_quarantine.get(r.reading_id, ()))
         trip_readings.append(
@@ -1097,7 +1287,7 @@ def _load_cargo(db, cargo_id: str) -> Cargo:
 def cargo_report(cargo_id: str, db: Session = Depends(get_db)) -> ChainReport:
     """按合并读数时间线返回越温区间（含读数来源）与各责任方片段；未闭合区间标记未结束。"""
     cargo = _load_cargo(db, cargo_id)
-    events, loadings, readings, effective, quarantine = (
+    events, loadings, readings, effective, quarantine, standards = (
         timeline.load_cargo_context(db, cargo_id)
     )
     points = timeline.adopted_timeline(
@@ -1107,6 +1297,7 @@ def cargo_report(cargo_id: str, db: Session = Depends(get_db)) -> ChainReport:
         effective[0],
         effective[1],
         quarantine,
+        standards,
     )
 
     result = chain.rebuild_chain(
@@ -1114,9 +1305,15 @@ def cargo_report(cargo_id: str, db: Session = Depends(get_db)) -> ChainReport:
     )
 
     excursions = [_excursion_schema(ex) for ex in result.excursions]
+    current_entry = std_mod.current_entry(
+        standards, datetime.now(timezone.utc)
+    )
+    current_version = max((e.version for e in standards), default=0)
     return ChainReport(
         cargo_id=cargo.cargo_id,
         temp_upper_limit=Decimal(cargo.temp_upper_limit),
+        current_temp_upper_limit=Decimal(current_entry.temp_upper_limit),
+        current_version=current_version,
         current_holder=result.current_holder,
         excursions=excursions,
     )
@@ -1134,7 +1331,7 @@ def cargo_timeline(cargo_id: str, db: Session = Depends(get_db)) -> CargoTimelin
     实际采用的读数来源；交接（``changes_holder=true``）只来自货物自有事件。
     """
     _load_cargo(db, cargo_id)
-    events, loadings, readings, effective, quarantine = (
+    events, loadings, readings, effective, quarantine, standards = (
         timeline.load_cargo_context(db, cargo_id)
     )
     points = timeline.merged_timeline(
@@ -1144,6 +1341,7 @@ def cargo_timeline(cargo_id: str, db: Session = Depends(get_db)) -> CargoTimelin
         effective[0],
         effective[1],
         quarantine,
+        standards,
     )
     return CargoTimeline(
         cargo_id=cargo_id,
@@ -1156,6 +1354,9 @@ def cargo_timeline(cargo_id: str, db: Session = Depends(get_db)) -> CargoTimelin
                 reading_id=p.source_id if p.source == "vehicle" else None,
                 trip_id=p.trip_id,
                 temperature=(Decimal(p.temperature) if p.is_measurement else None),
+                temp_upper_limit=(
+                    Decimal(p.temp_limit) if p.is_measurement else None
+                ),
                 version=(p.temp_version if p.is_measurement else 0),
                 giver=p.giver,
                 receiver=p.receiver,
@@ -1220,11 +1421,11 @@ def _interval_schema(view) -> ResponsibilityInterval:
 
 def _closed_interval_views(db, cargo: Cargo):
     """在合并时间线上重建并为每个已闭合区间装配责任确认视图（按开始时间升序）。"""
-    events, loadings, readings, effective, quarantine = (
+    events, loadings, readings, effective, quarantine, standards = (
         timeline.load_cargo_context(db, cargo.cargo_id)
     )
     result, closed = responsibility.rebuild(
-        cargo, events, loadings, readings, effective, quarantine
+        cargo, events, loadings, readings, effective, quarantine, standards
     )
     views = []
     for ex in sorted(closed.values(), key=lambda e: e.start):
@@ -1338,11 +1539,11 @@ def list_stance_history(
     rows = stance_crud.load_interval_stances(db, cargo_id, interval_id)
 
     # 当前区间状态（不因此报 404/422：历史要始终可查）
-    events, loadings, readings, effective, quarantine = (
+    events, loadings, readings, effective, quarantine, standards = (
         timeline.load_cargo_context(db, cargo_id)
     )
     chain_result, closed = responsibility.rebuild(
-        cargo, events, loadings, readings, effective, quarantine
+        cargo, events, loadings, readings, effective, quarantine, standards
     )
     ex = closed.get(interval_id)
     open_ex = next(

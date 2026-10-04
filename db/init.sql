@@ -241,6 +241,43 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_loading_correction_window_version
 CREATE INDEX IF NOT EXISTS ix_loading_correction_window
     ON loading_correction (trip_id, cargo_id, origin_loaded_at, created_at);
 
+-- 货物温度上限分时生效变更（append-only：只追加，不修改不删除）。
+-- 初始上限存于 cargo.temp_upper_limit，作为版本 0 自货物起始时刻生效；
+-- 本表每行是一次标准变更，version 为提交序号（首次为 1，乐观锁）。
+-- 上限按左闭右开阶梯函数分时生效：t 时刻已采用读数取“生效时刻 <= t 的
+-- 最新一条标准”，恰在生效时刻的读数采用新上限。允许补录 / 预约；
+-- 同一货物同一生效时刻至多一条变更（货物起始时刻属于初始版本，应用侧
+-- 拒绝），生效时刻早于货物起始时刻拒绝。
+CREATE TABLE IF NOT EXISTS temp_standard_change (
+    change_id        VARCHAR(64)   PRIMARY KEY,
+    cargo_id         VARCHAR(64)   NOT NULL
+                       REFERENCES cargo(cargo_id) ON DELETE RESTRICT,
+    effective_at     TIMESTAMPTZ   NOT NULL,
+    new_upper_limit  NUMERIC(10,3) NOT NULL,
+    expected_version INTEGER       NOT NULL,
+    version          INTEGER       NOT NULL,
+    reason           VARCHAR(512)  NOT NULL,
+    created_at       TIMESTAMPTZ   NOT NULL DEFAULT now(),
+
+    CONSTRAINT chk_temp_standard_change_shape CHECK (
+        expected_version >= 0
+        AND version >= 1
+        AND new_upper_limit IS NOT NULL
+        AND char_length(reason) > 0
+    )
+);
+
+-- 同一货物下版本号唯一（应用侧在货物行锁内按提交序号分配）
+CREATE UNIQUE INDEX IF NOT EXISTS ux_temp_standard_cargo_version
+    ON temp_standard_change (cargo_id, version);
+
+-- 同一货物同一生效时刻至多一条变更
+CREATE UNIQUE INDEX IF NOT EXISTS ux_temp_standard_cargo_effective_at
+    ON temp_standard_change (cargo_id, effective_at);
+
+CREATE INDEX IF NOT EXISTS ix_temp_standard_cargo_time
+    ON temp_standard_change (cargo_id, effective_at);
+
 -- 责任证据封存（append-only：封存内容此后不可改）。
 -- 调查人员凭案件编号（主键）、货物编号、已闭合区间稳定标识与当前快照标识封存；
 -- content 为封存时刻的规范化 JSON 原文，content_digest 为其 SHA-256 摘要；

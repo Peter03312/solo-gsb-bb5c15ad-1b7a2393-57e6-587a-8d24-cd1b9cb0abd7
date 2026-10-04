@@ -121,11 +121,11 @@ def _create_seal_tx(db, payload: EvidenceSealCreate) -> SealWriteResult:
         from app import responsibility as resp_mod
         from app import stance_crud
 
-        events, loadings, readings, effective, quarantine = load_cargo_context(
-            db, cargo_id
+        events, loadings, readings, effective, quarantine, standards = (
+            load_cargo_context(db, cargo_id)
         )
         chain_result, closed_map = resp_mod.rebuild(
-            cargo, events, loadings, readings, effective, quarantine
+            cargo, events, loadings, readings, effective, quarantine, standards
         )
         ex = closed_map.get(interval_key)
         if ex is None:
@@ -168,6 +168,7 @@ def _create_seal_tx(db, payload: EvidenceSealCreate) -> SealWriteResult:
             effective,
             sealed_at,
             reading_quarantine=quarantine,
+            standards=standards,
         )
 
         row = EvidenceSeal(

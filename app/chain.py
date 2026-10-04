@@ -43,6 +43,10 @@ class TimelinePoint:
     无更正时即原始温度）；``temp_version`` 为该有效温度的更正版本
     （0=原始值，n>=1 表示取第 n 次更正值）。``quarantine_faults`` 为覆盖该
     车载读数的生效探头故障编号（空元组=未隔离；自有 / 交接点恒为空）。
+    ``temp_limit`` 为该测温时刻**当时生效的货物温度上限**（温度标准分时
+    生效：取生效时刻 <= 读数时刻的最新一条，边界读数取新上限）；交接点
+    与未标注时为 None，重建退化为 :func:`rebuild_chain` 传入的固定上限
+    （即初始上限，兼容旧调用 / 单测）。
     交接点二者无意义。
     """
 
@@ -57,6 +61,9 @@ class TimelinePoint:
     adopted: bool = True
     temp_version: int = 0
     quarantine_faults: tuple[str, ...] = ()
+    # 该测温时刻当时生效的温度上限（标准版本）；None=用 rebuild_chain 的
+    # 固定上限参数（向后兼容：不标注的调用方仍得到初始上限语义）
+    temp_limit: Decimal | None = None
 
     @property
     def is_handover(self) -> bool:
@@ -90,6 +97,7 @@ def measurement_point(
     source_id: str | None = None,
     trip_id: str | None = None,
     adopted: bool = True,
+    temp_limit: Decimal | None = None,
 ) -> TimelinePoint:
     return TimelinePoint(
         occurred_at=occurred_at,
@@ -99,6 +107,7 @@ def measurement_point(
         source_id=source_id,
         trip_id=trip_id,
         adopted=adopted,
+        temp_limit=Decimal(temp_limit) if temp_limit is not None else None,
     )
 
 
@@ -171,11 +180,18 @@ def rebuild_chain(
     initial_holder: str,
     temp_upper_limit: Decimal,
     items: list,
+    standards: tuple = (),
 ) -> ChainResult:
     """按时间线重建当前保管方与全部越温区间（含责任片段）。
 
     ``items`` 可为自有 :class:`Event` 列表、:class:`TimelinePoint` 列表或二者混合。
     未被采用（``adopted=False``）的车载测温点不参与重建。
+
+    越温判定优先采用测温点自带的**当时生效上限**
+    ``TimelinePoint.temp_limit``（货物温度上限分时生效，见
+    :mod:`app.standards`：恰在标准生效时刻的读数取新上限）；未标注时退化为
+    固定参数 ``temp_upper_limit``（初始上限），保持旧调用兼容。
+    ``standards`` 预留给阶梯上限的进一步装配，当前以点上标注为准。
     """
     limit = Decimal(temp_upper_limit)
     holder = initial_holder
@@ -189,7 +205,8 @@ def rebuild_chain(
         if not p.adopted:
             continue
         if p.is_measurement:
-            over = Decimal(p.temperature) > limit
+            point_limit = Decimal(p.temp_limit) if p.temp_limit is not None else limit
+            over = Decimal(p.temperature) > point_limit
             if open_start is None and over:
                 # 开启越温：当前保管方自测温时刻起担责
                 open_start = p.occurred_at

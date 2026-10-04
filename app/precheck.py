@@ -20,13 +20,24 @@
 
     [trip_id, trip_revision,
      [[cargo_id, loaded_at, unloaded_at], ...],            -- 本批时段（排序）
-     [[cargo_id, temp_upper_limit], ...],                  -- 涉及货物（排序）
+     [[cargo_id, [version, effective_at, limit], ...], ...],-- 涉及货物完整
+                                                            --   温度标准历程
      [[reading_id, read_at, version, effective_temp], ...]]-- 车次读数（排序）
 
-其中“涉及货物”为本批货物与该车次既有装卸货物之并集（货物版本指纹＝其
-温度上限）；“车次读数”为该车次全部既有读数及其更正版本与有效温度
-（读数版本指纹）。确认时服务端按当前数据重算指纹：车次修订号、货物
-温度上限或读数版本任一变化都会使指纹改变，过期摘要即被拒绝。
+其中“涉及货物”为本批货物与该车次既有装卸货物之并集，货物版本指纹为其
+**完整温度标准历程**（初始版本 + 历次变更；货物温度上限分时生效，见
+:mod:`app.standards`）；“车次读数”为该车次全部既有读数及其更正版本与
+有效温度（读数版本指纹）。确认时服务端按当前数据重算指纹：车次修订号、
+货物温度标准（补录 / 预约变更同样改变指纹）或读数版本任一变化都会使
+指纹改变，过期摘要即被拒绝。
+
+温度上限分时生效的分段
+----------------------
+一票货物的上限按左闭右开阶梯函数变化时，车上货物集合相同但跨越了某票
+货物的标准变更时刻的时段必须**二次分段**（边界读数取新上限）：分段
+边界取自全部涉及货物标准变更的生效时刻（恰在边界的读数归入右侧新段，
+与其左闭右开语义一致）。每段内各票货物的上限恒定，段首给出
+min / max / 极差；潜在越温风险按读数时刻各票货物的**当时上限**判定。
 """
 from __future__ import annotations
 
@@ -132,6 +143,37 @@ def boarding_segments(windows: list[BoardWindow]) -> list[BoardSegment]:
     return segments
 
 
+def split_segments_at(
+    segments: list[BoardSegment], cut_points
+) -> list[BoardSegment]:
+    """在给定时刻点把分段二次切开（左闭右开：边界点属于右侧新段）。
+
+    用于温度标准分时生效：某票货物的标准变更时刻即使不改变车上货物集合，
+    也必须成为分段边界，使每段内各票货物上限恒定。恰在边界的车载读数归入
+    右侧段（其当时上限即新标准），与“边界读数采用新上限”一致。
+    """
+    cuts = sorted({ensure_utc(t) for t in cut_points})
+    out: list[BoardSegment] = []
+    for seg in segments:
+        start, end = seg.start, seg.end
+        for cut in cuts:
+            if start < cut < end:
+                out.append(
+                    BoardSegment(
+                        start, end=cut,
+                        cargo_ids=seg.cargo_ids, proposed_ids=seg.proposed_ids,
+                    )
+                )
+                start = cut
+        out.append(
+            BoardSegment(
+                start, end=end,
+                cargo_ids=seg.cargo_ids, proposed_ids=seg.proposed_ids,
+            )
+        )
+    return out
+
+
 @dataclass(frozen=True)
 class ReadingInfo:
     """一笔车载读数的预检视图：有效温度（含更正）与更正版本。"""
@@ -173,21 +215,39 @@ class SegmentAnalysis:
 def analyze_segments(
     segments: list[BoardSegment],
     readings: list[ReadingInfo],
-    temp_limits: dict[str, Decimal],
+    temp_limits,
     own_measure_at: dict[str, set] | None = None,
 ) -> list[SegmentAnalysis]:
     """对每个分段计算温度上限差异、读数覆盖与潜在越温风险。
 
-    :param segments: :func:`boarding_segments` 的输出。
+    :param segments: :func:`boarding_segments`（再经
+        :func:`split_segments_at` 按标准变更时刻切开）的输出。
     :param readings: 该车次的全部既有车载读数（有效温度 + 版本）。
-    :param temp_limits: 货物编号 -> 温度上限（须覆盖段内全部货物）。
+    :param temp_limits: 货物的温度上限口径——
+
+        * ``dict[cargo_id, Decimal]``：固定上限（旧口径 / 无标准历程时）；
+        * ``dict[cargo_id, tuple[StandardEntry, ...]]``：完整温度标准历程
+          （含初始版本），段内极差按**段起点时刻**的当时上限计算，逐笔风险
+          按**读数时刻**的当时上限判定（左闭，边界读数取新上限）。
     :param own_measure_at: 货物编号 -> 该货物自有测温时刻集合
         （用于标记同刻自有测温取代车载读数的情形）。
     """
     own_measure_at = own_measure_at or {}
+    from app.standards import StandardEntry, limit_at as _limit_at
+
+    def _is_series(v) -> bool:
+        return bool(v) and isinstance(v, tuple) and isinstance(v[0], StandardEntry)
+
+    def _limit(cargo_id: str, at):
+        spec = temp_limits[cargo_id]
+        if _is_series(spec):
+            return Decimal(_limit_at(spec, at))
+        return Decimal(spec)
+
     analyses: list[SegmentAnalysis] = []
     for seg in segments:
-        limits = [Decimal(temp_limits[c]) for c in seg.cargo_ids]
+        # 段起点时刻各票货物的当时上限（段内已按标准变更时刻切开，故恒定）
+        limits = [_limit(c, seg.start) for c in seg.cargo_ids]
         lo, hi = min(limits), max(limits)
         covered = tuple(
             r for r in readings if seg.start <= r.read_at < seg.end
@@ -195,7 +255,9 @@ def analyze_segments(
         risks: list[RiskEntry] = []
         for r in covered:
             for cargo_id in seg.cargo_ids:
-                limit = Decimal(temp_limits[cargo_id])
+                # 风险按读数时刻该货物的当时上限判定（标准在段内不变；
+                # 读数恰在标准生效时刻时归入右侧段，已取到新上限）
+                limit = _limit(cargo_id, r.read_at)
                 if Decimal(r.effective_temperature) > limit:
                     risks.append(
                         RiskEntry(
@@ -230,16 +292,44 @@ def manifest_digest(
     trip_id: str,
     trip_revision: int,
     items,
-    cargos: dict[str, Decimal],
+    cargos,
     readings: list[ReadingInfo],
 ) -> str:
     """计算预检摘要指纹（``sha256:`` 前缀）。
 
     :param items: 本批拟登记时段 ``(cargo_id, loaded_at, unloaded_at)``
         （已归一化到 UTC）。
-    :param cargos: 涉及货物（本批 ∪ 车次既有装卸）编号 -> 温度上限。
+    :param cargos: 涉及货物（本批 ∪ 车次既有装卸）编号 -> 温度上限口径。
+        值可为固定上限 ``Decimal``（旧口径）或完整温度标准历程
+        ``tuple[StandardEntry, ...]``（含初始版本；标准变更使指纹变化）。
     :param readings: 该车次全部既有车载读数（有效温度 + 更正版本）。
     """
+    from app.standards import StandardEntry
+
+    cargo_fingerprints = []
+    for cargo_id in sorted(cargos):
+        spec = cargos[cargo_id]
+        if isinstance(spec, tuple) and spec and isinstance(spec[0], StandardEntry):
+            cargo_fingerprints.append(
+                [
+                    cargo_id,
+                    [
+                        [
+                            int(e.version),
+                            _canon_dt(e.effective_at),
+                            _canon_temp(e.temp_upper_limit),
+                        ]
+                        for e in sorted(spec, key=lambda x: x.effective_at)
+                    ],
+                ]
+            )
+        else:
+            # 固定上限口径：等价于“仅有初始版本”，初始生效时刻不参与指纹
+            # （货物编号已隐含其起始时刻；保留与旧指纹形状的区分由列表层级体现）
+            cargo_fingerprints.append(
+                [cargo_id, [[0, None, _canon_temp(spec)]]]
+            )
+
     payload = [
         trip_id,
         int(trip_revision),
@@ -247,10 +337,7 @@ def manifest_digest(
             [cargo_id, _canon_dt(loaded_at), _canon_dt(unloaded_at)]
             for cargo_id, loaded_at, unloaded_at in items
         ),
-        sorted(
-            [cargo_id, _canon_temp(limit)]
-            for cargo_id, limit in cargos.items()
-        ),
+        cargo_fingerprints,
         sorted(
             [
                 r.reading_id,
