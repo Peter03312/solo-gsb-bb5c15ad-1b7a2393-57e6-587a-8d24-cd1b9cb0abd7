@@ -232,6 +232,7 @@ def rebuild(
     vehicle_readings=None,
     effective=None,
     quarantine=None,
+    limit_changes=None,
 ) -> tuple[object, dict[str, ExcursionResult]]:
     """在合并读数时间线上重建保管链，返回（重建结果, 区间标识 -> 闭合区间）。
 
@@ -239,9 +240,12 @@ def rebuild(
     为该货物的装卸时段与相关车载读数（缺省时退化为仅自有事件，兼容旧调用）。
     ``effective`` 为 ``(event_effective, reading_effective)`` 更正有效值映射；
     ``quarantine`` 为车载读数ID -> 生效探头故障编号元组的隔离映射（被覆盖
-    的车载读数不参与重建）。
+    的车载读数不参与重建）；``limit_changes`` 为该货物分时生效温度上限标准
+    的变更行（缺省退化为固定初始上限，兼容旧调用）——每笔已采用测温按其
+    当时生效的上限判定越温。
     """
     from app import chain, timeline
+    from app import standards as standards_mod
 
     if loadings is None or vehicle_readings is None:
         items = list(own_events)
@@ -255,8 +259,13 @@ def rebuild(
             reading_effective,
             quarantine or {},
         )
+    if limit_changes is None:
+        limit_arg = Decimal(cargo.temp_upper_limit)
+    else:
+        history = standards_mod.build_limit_history(cargo, limit_changes)
+        limit_arg = standards_mod.limit_resolver(history)
     result = chain.rebuild_chain(
-        cargo.initial_holder, Decimal(cargo.temp_upper_limit), items
+        cargo.initial_holder, limit_arg, items
     )
     closed = {
         interval_id(ex): ex for ex in result.excursions if not ex.is_open

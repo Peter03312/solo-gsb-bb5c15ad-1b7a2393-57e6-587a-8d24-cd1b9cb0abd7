@@ -4,7 +4,7 @@
 一键启动    : docker compose up --build  （见 README）
 """
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 
 from fastapi import Depends, FastAPI, Request
@@ -18,10 +18,12 @@ from app import (
     crud,
     evidence_crud,
     faults as faults_mod,
+    limit_change_crud,
     loading_correction_crud,
     probe_fault_crud,
     responsibility,
     sealing,
+    standards,
     stance_crud,
     timeline,
     vehicle_crud,
@@ -34,6 +36,7 @@ from app.models import (
     ProbeFault,
     Stance,
     StanceKind,
+    TemperatureLimitChange,
     Trip,
     VehicleReading,
 )
@@ -99,6 +102,12 @@ from app.schemas import (
     StanceOut,
     StanceReplay,
     StanceSegment,
+    TempLimitChangeAck,
+    TempLimitChangeCreate,
+    TempLimitChangeOut,
+    TempLimitChangeReplay,
+    TempLimitStandardHistory,
+    TempLimitStandardItem,
     TimelinePointOut,
     TripCreate,
     TripDetail,
@@ -269,6 +278,39 @@ async def lifespan(app: FastAPI):
                 )
                 """
             )
+            # 6) 货物温度上限标准变更表（新表，IF NOT EXISTS 兜底；append-only）
+            conn.exec_driver_sql(
+                """
+                CREATE TABLE IF NOT EXISTS temp_limit_change (
+                    change_id        VARCHAR(64)   PRIMARY KEY,
+                    cargo_id         VARCHAR(64)   NOT NULL
+                                     REFERENCES cargo(cargo_id) ON DELETE RESTRICT,
+                    effective_at     TIMESTAMPTZ   NOT NULL,
+                    expected_version INTEGER       NOT NULL,
+                    version          INTEGER       NOT NULL,
+                    new_limit        NUMERIC(10,3) NOT NULL,
+                    reason           VARCHAR(512)  NOT NULL,
+                    created_at       TIMESTAMPTZ   NOT NULL DEFAULT now(),
+                    CONSTRAINT chk_temp_limit_change_shape CHECK (
+                        new_limit IS NOT NULL
+                        AND expected_version >= 0
+                        AND version >= 1
+                    )
+                )
+                """
+            )
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_temp_limit_change_cargo_time "
+                "ON temp_limit_change (cargo_id, effective_at)"
+            )
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ux_temp_limit_change_cargo_version "
+                "ON temp_limit_change (cargo_id, version)"
+            )
+            conn.exec_driver_sql(
+                "CREATE INDEX IF NOT EXISTS ix_temp_limit_change_cargo "
+                "ON temp_limit_change (cargo_id, effective_at)"
+            )
     yield
 
 
@@ -298,8 +340,17 @@ app = FastAPI(
         "越温报告、责任确认与同时越温随之重算，旧表态历史与封存原包保持"
         "原样，封存现况对照反映变化；写入与相关装卸/读数/更正/表态串行，"
         "成功推进车次修订号使旧预检摘要失效。"
+        "质控人员可对货物登记分时生效的温度上限标准（带时区生效时刻、"
+        "新上限、期望标准版本与原因；初始上限自货物起始时刻生效，允许"
+        "补录与预约，同刻仅一条、边界读数采用新上限，变更不产生测温或"
+        "交接）：时间线、越温报告、责任确认与车次同时越温按每笔已采用"
+        "读数当时的上限重建，装前预检在标准变更时刻分段且摘要绑定完整"
+        "标准历程（标准变化后旧摘要确认拒绝），新封存包记录各证据读数"
+        "采用的上限与标准历程，既有封存包及摘要不变、现况对照呈现标准"
+        "变化引起的差异；同编号同请求重传返回原结果，异内容 / 版本过期 / "
+        "早于货物起始 / 同刻冲突均拒绝且不留部分写入。"
     ),
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -423,6 +474,144 @@ def list_events(cargo_id: str, db: Session = Depends(get_db)) -> list[EventOut]:
         _event_out(e, event_eff.get(e.event_id))
         for e in events
     ]
+
+
+# ----------------------------------------------------- 温度上限标准（分时生效）
+
+
+def _standard_history_out(db, cargo: Cargo) -> TempLimitStandardHistory:
+    changes = standards.load_limit_changes(db, cargo.cargo_id)
+    history = standards.build_limit_history(cargo, changes)
+    # 变更行编号 -> 登记时刻（LimitEntry 不携带登记时刻，历程条目需要展示）
+    created_at_map = {
+        row.change_id: ensure_utc(row.created_at) for row in changes
+    }
+    now = datetime.now(timezone.utc)
+    current_entry = standards.entry_at(history, now)
+    items = []
+    for e in history:
+        items.append(
+            TempLimitStandardItem(
+                effective_at=e.effective_at,
+                temp_upper_limit=Decimal(e.temp_upper_limit),
+                version=e.version,
+                source=e.source,
+                change_id=e.change_id,
+                expected_version=(
+                    e.version - 1 if e.source == "change" else None
+                ),
+                reason=e.reason,
+                created_at=(
+                    created_at_map.get(e.change_id)
+                    if e.source == "change"
+                    else None
+                ),
+            )
+        )
+    return TempLimitStandardHistory(
+        cargo_id=cargo.cargo_id,
+        started_at=ensure_utc(cargo.started_at),
+        version=standards.current_standard_version(changes),
+        current_limit=Decimal(current_entry.temp_upper_limit),
+        standards=items,
+    )
+
+
+def _limit_change_out(row: TemperatureLimitChange) -> TempLimitChangeOut:
+    return TempLimitChangeOut(
+        change_id=row.change_id,
+        cargo_id=row.cargo_id,
+        effective_at=ensure_utc(row.effective_at),
+        expected_version=row.expected_version,
+        version=row.version,
+        new_limit=Decimal(row.new_limit),
+        reason=row.reason,
+        created_at=ensure_utc(row.created_at),
+    )
+
+
+@app.post(
+    "/cargo/{cargo_id}/temp-limits",
+    response_model=TempLimitChangeAck,
+    status_code=201,
+    tags=["温度上限标准"],
+    responses={
+        200: {
+            "model": TempLimitChangeReplay,
+            "description": "同变更编号同请求重传：返回原结果（幂等）",
+        },
+        404: {"description": "货物不存在"},
+        409: {
+            "description": "变更编号异请求冲突 / 标准版本过期 / 同刻冲突"
+        },
+        422: {
+            "description": "生效时刻缺时区 / 早于货物起始时刻 / 上限非法 / 原因为空"
+        },
+    },
+)
+def submit_temp_limit_change(
+    cargo_id: str,
+    payload: TempLimitChangeCreate,
+    db: Session = Depends(get_db),
+):
+    """登记货物**分时生效温度上限**的一条标准变更（append-only）。
+
+    质控人员凭变更编号、带时区生效时刻（左闭：恰在该时刻的读数采用新上限）、
+    新上限、**期望标准版本**与原因提交；允许补录（生效时刻早于当前时刻）与
+    预约（晚于当前时刻），生效时刻不得早于货物起始时刻（初始上限自此生效）。
+    同一货物同一生效时刻至多一条变更；期望版本与当前版本不一致即拒绝。
+    变更本身不产生测温或交接——货物时间线、越温报告、责任确认与车次同时
+    越温一律按每笔已采用读数**当时**的上限重建。同变更编号同请求重传返回
+    原结果，异内容 / 版本过期 / 同刻冲突均拒绝且不留部分写入。
+    """
+    value = payload.effective_at
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise crud.ApiError(
+            422,
+            "timezone_required",
+            "字段 effective_at 必须携带时区偏移"
+            "（如 2026-10-04T09:00:00+08:00）",
+        )
+    payload.effective_at = ensure_utc(value)
+    result = limit_change_crud.submit_limit_change(db, cargo_id, payload)
+
+    cargo = db.get(Cargo, cargo_id)
+    cargo.started_at = ensure_utc(cargo.started_at)
+    history_out = _standard_history_out(db, cargo)
+    ack = TempLimitChangeAck(
+        change=_limit_change_out(result.change),
+        version=result.version,
+        history=history_out,
+    )
+    if result.replayed:
+        return JSONResponse(
+            status_code=200,
+            content=TempLimitChangeReplay(
+                **ack.model_dump(mode="json"),
+                message="相同请求的温度上限标准变更已存在，重传返回原结果（幂等）",
+            ).model_dump(mode="json"),
+        )
+    return ack
+
+
+@app.get(
+    "/cargo/{cargo_id}/temp-limits",
+    response_model=TempLimitStandardHistory,
+    tags=["温度上限标准"],
+    responses={404: {"description": "货物不存在"}},
+)
+def get_temp_limit_standards(
+    cargo_id: str, db: Session = Depends(get_db)
+) -> TempLimitStandardHistory:
+    """返回货物**完整温度上限标准历程**与当前版本。
+
+    历程首条恒为初始上限（``version=0``、自货物起始时刻生效，即货物创建时
+    的 ``temp_upper_limit``），其后为按生效时刻 / 版本升序的各条变更
+    （允许补录与预约，同刻仅一条）；``version`` 为标准当前版本（成功变更
+    条数），``current_limit`` 为查询时刻生效中的上限（不含未来预约）。
+    """
+    cargo = _load_cargo(db, cargo_id)
+    return _standard_history_out(db, cargo)
 
 
 # ---------------------------------------------------------------- 车次 / 装卸 / 车载读数
@@ -664,7 +853,8 @@ def _excursion_schema(ex) -> Excursion:
 
 
 def _trip_reading_application(
-    db, reading: VehicleReading, loadings, cargos, reading_eff, reading_quarantine
+    db, reading: VehicleReading, loadings, cargos, reading_eff,
+    reading_quarantine, limit_histories,
 ):
     """一笔车载读数对车次上各票货物的适用性/采用情况。"""
     apps = []
@@ -699,6 +889,12 @@ def _trip_reading_application(
         supplanted = bool(on_board and own_at.get(cargo_id))
         # 同刻自有优先：被取代与被故障隔离同时成立时，首要原因标记为被自有取代
         adopted = bool(on_board and not own_at.get(cargo_id) and not covers)
+        # 分时温度上限：读数时刻对该货物当时生效的标准（边界采用新上限）
+        applied_limit = (
+            standards.limit_resolver(limit_histories[cargo_id])(read_at)
+            if cargo_id in limit_histories
+            else Decimal(cargos[cargo_id].temp_upper_limit)
+        )
         over = None
         reason = "adopted"
         if not on_board:
@@ -708,13 +904,14 @@ def _trip_reading_application(
         elif covers:
             reason = "quarantined"
         if on_board:
-            over = eff_temp > Decimal(cargos[cargo_id].temp_upper_limit)
+            over = eff_temp > applied_limit
         apps.append(
             ReadingApplication(
                 cargo_id=cargo_id,
                 on_board=on_board,
                 adopted=adopted,
                 over_limit=over,
+                temp_upper_limit=(applied_limit if on_board else None),
                 quarantined=quarantined,
                 covering_fault_ids=covers,
                 reason=reason,
@@ -785,10 +982,19 @@ def get_trip_detail(trip_id: str, db: Session = Depends(get_db)) -> TripDetail:
     )
     fault_rows = faults_mod.load_trip_faults(db, trip_id)
 
+    # 各票货物的分时温度上限标准历程（车次详情逐货物适用性按读数当时上限判定）
+    limit_histories = {
+        cid: standards.build_limit_history(
+            cargo, standards.load_limit_changes(db, cid)
+        )
+        for cid, cargo in cargos.items()
+    }
+
     trip_readings = []
     for r in readings:
         apps = _trip_reading_application(
-            db, r, loadings, cargos, reading_eff, reading_quarantine
+            db, r, loadings, cargos, reading_eff, reading_quarantine,
+            limit_histories,
         )
         covers = list(reading_quarantine.get(r.reading_id, ()))
         trip_readings.append(
@@ -1097,7 +1303,7 @@ def _load_cargo(db, cargo_id: str) -> Cargo:
 def cargo_report(cargo_id: str, db: Session = Depends(get_db)) -> ChainReport:
     """按合并读数时间线返回越温区间（含读数来源）与各责任方片段；未闭合区间标记未结束。"""
     cargo = _load_cargo(db, cargo_id)
-    events, loadings, readings, effective, quarantine = (
+    events, loadings, readings, effective, quarantine, limit_changes = (
         timeline.load_cargo_context(db, cargo_id)
     )
     points = timeline.adopted_timeline(
@@ -1108,15 +1314,16 @@ def cargo_report(cargo_id: str, db: Session = Depends(get_db)) -> ChainReport:
         effective[1],
         quarantine,
     )
-
+    history = standards.build_limit_history(cargo, limit_changes)
     result = chain.rebuild_chain(
-        cargo.initial_holder, Decimal(cargo.temp_upper_limit), points
+        cargo.initial_holder, standards.limit_resolver(history), points
     )
 
     excursions = [_excursion_schema(ex) for ex in result.excursions]
     return ChainReport(
         cargo_id=cargo.cargo_id,
         temp_upper_limit=Decimal(cargo.temp_upper_limit),
+        standard_version=standards.current_standard_version(limit_changes),
         current_holder=result.current_holder,
         excursions=excursions,
     )
@@ -1133,8 +1340,8 @@ def cargo_timeline(cargo_id: str, db: Session = Depends(get_db)) -> CargoTimelin
     含被自有测温取代（``adopted=false``）的车载读数，可查每票货物各时刻
     实际采用的读数来源；交接（``changes_holder=true``）只来自货物自有事件。
     """
-    _load_cargo(db, cargo_id)
-    events, loadings, readings, effective, quarantine = (
+    cargo = _load_cargo(db, cargo_id)
+    events, loadings, readings, effective, quarantine, limit_changes = (
         timeline.load_cargo_context(db, cargo_id)
     )
     points = timeline.merged_timeline(
@@ -1145,6 +1352,8 @@ def cargo_timeline(cargo_id: str, db: Session = Depends(get_db)) -> CargoTimelin
         effective[1],
         quarantine,
     )
+    history = standards.build_limit_history(cargo, limit_changes)
+    limit_at = standards.limit_resolver(history)
     return CargoTimeline(
         cargo_id=cargo_id,
         points=[
@@ -1156,6 +1365,9 @@ def cargo_timeline(cargo_id: str, db: Session = Depends(get_db)) -> CargoTimelin
                 reading_id=p.source_id if p.source == "vehicle" else None,
                 trip_id=p.trip_id,
                 temperature=(Decimal(p.temperature) if p.is_measurement else None),
+                temp_upper_limit=(
+                    limit_at(p.occurred_at) if p.is_measurement else None
+                ),
                 version=(p.temp_version if p.is_measurement else 0),
                 giver=p.giver,
                 receiver=p.receiver,
@@ -1220,11 +1432,11 @@ def _interval_schema(view) -> ResponsibilityInterval:
 
 def _closed_interval_views(db, cargo: Cargo):
     """在合并时间线上重建并为每个已闭合区间装配责任确认视图（按开始时间升序）。"""
-    events, loadings, readings, effective, quarantine = (
+    events, loadings, readings, effective, quarantine, limit_changes = (
         timeline.load_cargo_context(db, cargo.cargo_id)
     )
     result, closed = responsibility.rebuild(
-        cargo, events, loadings, readings, effective, quarantine
+        cargo, events, loadings, readings, effective, quarantine, limit_changes
     )
     views = []
     for ex in sorted(closed.values(), key=lambda e: e.start):
@@ -1338,11 +1550,11 @@ def list_stance_history(
     rows = stance_crud.load_interval_stances(db, cargo_id, interval_id)
 
     # 当前区间状态（不因此报 404/422：历史要始终可查）
-    events, loadings, readings, effective, quarantine = (
+    events, loadings, readings, effective, quarantine, limit_changes = (
         timeline.load_cargo_context(db, cargo_id)
     )
     chain_result, closed = responsibility.rebuild(
-        cargo, events, loadings, readings, effective, quarantine
+        cargo, events, loadings, readings, effective, quarantine, limit_changes
     )
     ex = closed.get(interval_id)
     open_ex = next(

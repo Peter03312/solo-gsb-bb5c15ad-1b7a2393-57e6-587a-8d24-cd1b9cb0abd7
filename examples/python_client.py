@@ -849,5 +849,77 @@ def main() -> None:
               "covering =", old["covering_fault_ids"])
 
 
+        # ================= 本轮新增：货物分时生效温度上限 =================
+        tc = "COLD-TL-PY-1"
+        show("创建货物（初始上限 5℃）", api.post("/cargo", json={
+            "cargo_id": tc,
+            "started_at": "2026-10-04T08:00:00+08:00",
+            "temp_upper_limit": "5.0",
+            "initial_holder": "北京冷库"}))
+        hist = api.get(f"/cargo/{tc}/temp-limits").json()
+        print("初始标准版本 =", hist["version"], "；当前上限 =", hist["current_limit"],
+              "；历程条数 =", len(hist["standards"]))
+
+        # 预约：10-05 00:00 起收紧为 4℃
+        show("预约标准变更（expected_version=0）", api.post(
+            f"/cargo/{tc}/temp-limits", json={
+                "change_id": "tl-py-1",
+                "effective_at": "2026-10-05T00:00:00+08:00",
+                "new_limit": "4.0",
+                "expected_version": 0,
+                "reason": "冬季温控收紧"}))
+        # 同编号同请求重传 -> replayed
+        rp = api.post(f"/cargo/{tc}/temp-limits", json={
+            "change_id": "tl-py-1",
+            "effective_at": "2026-10-05T00:00:00+08:00",
+            "new_limit": "4.0",
+            "expected_version": 0,
+            "reason": "冬季温控收紧"}).json()
+        print("重传 replayed =", rp.get("replayed"))
+        # 边界读数：生效前 4.5 不越温；恰在生效时刻 4.5 按新上限 4 越温
+        api.post("/events", json={"event_id": "tl-py-m0", "cargo_id": tc,
+                  "occurred_at": "2026-10-04T23:30:00+08:00",
+                  "temperature": "4.5"})
+        api.post("/events", json={"event_id": "tl-py-m1", "cargo_id": tc,
+                  "occurred_at": "2026-10-05T00:00:00+08:00",
+                  "temperature": "4.5"})
+        api.post("/events", json={"event_id": "tl-py-m2", "cargo_id": tc,
+                  "occurred_at": "2026-10-05T01:00:00+08:00",
+                  "temperature": "4.0"})
+        rep = api.get(f"/cargo/{tc}/report").json()
+        print("标准版本 =", rep["standard_version"], "；越温区间 =",
+              [(e["start"], e["end"]) for e in rep["excursions"]])
+        # 版本过期拒绝；正确版本可继续提交
+        bad = api.post(f"/cargo/{tc}/temp-limits", json={
+            "change_id": "tl-py-bad",
+            "effective_at": "2026-10-06T00:00:00+08:00",
+            "new_limit": "3.0", "expected_version": 0,
+            "reason": "过期版本"})
+        print("过期版本 ->", bad.status_code, bad.json()["error"]["code"])
+        show("第二次变更（expected_version=1）", api.post(
+            f"/cargo/{tc}/temp-limits", json={
+                "change_id": "tl-py-2",
+                "effective_at": "2026-10-06T00:00:00+08:00",
+                "new_limit": "3.0",
+                "expected_version": 1,
+                "reason": "进一步收紧"}))
+        # 补录：自货物起始即执行更严标准，历史按各读数当时上限重建
+        show("补录标准变更（自起始时刻生效）", api.post(
+            f"/cargo/{tc}/temp-limits", json={
+                "change_id": "tl-py-back",
+                "effective_at": "2026-10-04T08:00:00+08:00",
+                "new_limit": "4.0",
+                "expected_version": 2,
+                "reason": "起始即执行（补录）"}))
+        for p in api.get(f"/cargo/{tc}/timeline").json()["points"]:
+            if p["point_type"] == "measurement":
+                print("时间线点：", p["occurred_at"], p["temperature"],
+                      "℃ / 当时上限", p["temp_upper_limit"])
+        print("最终标准历程：",
+              [(s["version"], s["effective_at"], s["temp_upper_limit"])
+               for s in api.get(f"/cargo/{tc}/temp-limits").json()["standards"]])
+
+
+
 if __name__ == "__main__":
     main()

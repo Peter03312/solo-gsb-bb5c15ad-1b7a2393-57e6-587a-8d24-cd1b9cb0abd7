@@ -634,3 +634,117 @@ def test_concurrent_seal_and_probe_fault_share_consistent_view(client):
             if x["key"] == "vr-open"
         )
         assert removed["change"] == "removed"
+
+
+def test_concurrent_temp_limit_changes_serialize_by_version(client):
+    """并发温度上限标准变更经货物行锁 + 期望标准版本串行：
+
+    8 个线程同以 expected_version=0 提交**不同生效时刻**的变更，只有第一笔
+    抢到货物锁的 201，其余 409 stale_standard_version 且不留写入（版本仍为 1）。
+    """
+    client.post(
+        "/cargo",
+        json={
+            "cargo_id": "CTL",
+            "started_at": "2026-01-01T10:00:00+00:00",
+            "temp_upper_limit": "5",
+            "initial_holder": "A",
+        },
+    )
+
+    def submit(i):
+        return client.post(
+            "/cargo/CTL/temp-limits",
+            json={
+                "change_id": f"ct-{i}",
+                "effective_at": f"2026-01-01T11:{i:02d}:00+00:00",
+                "new_limit": str(4 - i * 0.1),
+                "expected_version": 0,
+                "reason": f"并发变更 {i}",
+            },
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        codes = list(pool.map(submit, range(8)))
+
+    assert codes.count(201) == 1
+    assert all(c == 409 for c in codes if c != 201)
+    body = client.get("/cargo/CTL/temp-limits").json()
+    assert body["version"] == 1
+    assert len(body["standards"]) == 2  # 初始 + 唯一一条成功变更
+
+    # 持锁后按最新版本串行提交，版本可连续推进到 8（无部分写入 / 无撕裂）
+    for v in range(1, 8):
+        r = client.post(
+            "/cargo/CTL/temp-limits",
+            json={
+                "change_id": f"ct-seq-{v}",
+                "effective_at": f"2026-01-01T12:{v:02d}:00+00:00",
+                "new_limit": str(3 - v * 0.1),
+                "expected_version": v,
+                "reason": f"串行变更 {v}",
+            },
+        )
+        assert r.status_code == 201, r.text
+    assert client.get("/cargo/CTL/temp-limits").json()["version"] == 8
+
+
+def test_concurrent_temp_limit_change_and_boundary_reading_consistent(client):
+    """标准变更与恰在其生效时刻的测温并发：货物行锁串行后视图确定。
+
+    变更（11:00 起上限收紧为 4）与 11:00 测温 4.5 无论谁先提交，最终重建
+    必一致：测温存在且标准存在 -> 该读数按新上限越温（边界采用新上限），
+    报告存在自 11:00 起的越温区间，标准版本为 1。
+    """
+    client.post(
+        "/cargo",
+        json={
+            "cargo_id": "CTB",
+            "started_at": "2026-01-01T10:00:00+00:00",
+            "temp_upper_limit": "5",
+            "initial_holder": "A",
+        },
+    )
+
+    def submit_change(_):
+        return client.post(
+            "/cargo/CTB/temp-limits",
+            json={
+                "change_id": "ct-boundary",
+                "effective_at": "2026-01-01T11:00:00+00:00",
+                "new_limit": "4",
+                "expected_version": 0,
+                "reason": "11 点收紧",
+            },
+        ).status_code
+
+    def submit_reading(i):
+        # 各线程独立事件 ID、同一时刻：恰有一笔测温成功，其余同刻冲突 409
+        # （SQLite 文件库 FOR UPDATE 为空操作；PG 下货物行锁串行裁决）
+        return client.post(
+            "/events",
+            json={
+                "event_id": f"m-boundary-{i}",
+                "cargo_id": "CTB",
+                "occurred_at": "2026-01-01T11:00:00+00:00",
+                "temperature": "4.5",
+            },
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        f_changes = [pool.submit(submit_change, i) for i in range(4)]
+        f_readings = [pool.submit(submit_reading, i) for i in range(4)]
+        change_codes = [f.result() for f in f_changes]
+        reading_codes = [f.result() for f in f_readings]
+
+    # 变更：1 笔 201，其余同编号同请求重传 200（绝不出现版本覆盖 / 部分写入）
+    assert change_codes.count(201) == 1
+    assert sorted(set(change_codes)) == [200, 201]
+    # 测温：同刻仅一笔（1 笔 201，其余同刻冲突 409）
+    assert reading_codes.count(201) == 1
+    assert all(c in (201, 409) for c in reading_codes)
+
+    body = client.get("/cargo/CTB/report").json()
+    assert body["standard_version"] == 1
+    assert len(body["excursions"]) == 1
+    assert body["excursions"][0]["start"] == "2026-01-01T11:00:00Z"

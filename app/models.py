@@ -559,6 +559,74 @@ class ProbeFaultRevocation(Base):
     fault: Mapped["ProbeFault"] = relationship(back_populates="revocation")
 
 
+class TemperatureLimitChange(Base):
+    """货物温度上限标准变更（append-only）：按带时区生效时刻分时生效。
+
+    质控人员可凭**变更编号** ``change_id`` 提交：货物编号、带时区生效时刻
+    ``effective_at``、**期望标准版本** ``expected_version`` 与新上限
+    ``new_limit`` 及原因。货物的**初始上限**（``cargo.temp_upper_limit``）
+    自货物起始时刻生效，不在本表建行；本表每条变更把该时刻（左闭，边界
+    读数采用新上限）起的上限切换为 ``new_limit``，允许补录（生效时刻早于
+    当前时刻）与预约（晚于当前时刻）。
+
+    ``expected_version`` 为乐观锁：必须等于提交时该货物标准的当前版本
+    （首次变更为 0，随后依次递增）；``version`` 为本次变更后的版本
+    （= expected_version + 1，也等于该货物标准变更的写入序号）。
+    同一货物同一生效时刻至多一条变更（部分唯一索引兜底）。变更本身不
+    产生测温或交接，只改变越温判定所用上限——货物时间线、越温报告、责任
+    确认、车次同时越温与封存证据一律按**每笔已采用读数当时的上限**重建。
+
+    既有 ``cargo.temp_upper_limit`` 字段语义不变：始终表示**初始上限**。
+    """
+
+    __tablename__ = "temp_limit_change"
+    __table_args__ = (
+        CheckConstraint(
+            "new_limit IS NOT NULL AND expected_version >= 0 "
+            "AND version >= 1",
+            name="chk_temp_limit_change_shape",
+        ),
+        # 同一货物同一生效时刻至多一条变更
+        Index(
+            "ux_temp_limit_change_cargo_time",
+            "cargo_id",
+            "effective_at",
+            unique=True,
+        ),
+        # 每个货物下版本号唯一（应用侧在货物行锁内按序号分配）
+        Index(
+            "ux_temp_limit_change_cargo_version",
+            "cargo_id",
+            "version",
+            unique=True,
+        ),
+        Index(
+            "ix_temp_limit_change_cargo",
+            "cargo_id",
+            "effective_at",
+        ),
+    )
+
+    change_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    cargo_id: Mapped[str] = mapped_column(
+        String(64),
+        ForeignKey("cargo.cargo_id", ondelete="RESTRICT"),
+        nullable=False,
+    )
+    effective_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False
+    )
+    expected_version: Mapped[int] = mapped_column(nullable=False)
+    version: Mapped[int] = mapped_column(nullable=False)
+    new_limit: Mapped[Decimal] = mapped_column(Numeric(10, 3), nullable=False)
+    reason: Mapped[str] = mapped_column(String(512), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True),
+        nullable=False,
+        default=lambda: datetime.now(timezone.utc),
+    )
+
+
 class EvidenceSeal(Base):
     """责任证据封存包（append-only，封存内容此后不可改）。
 

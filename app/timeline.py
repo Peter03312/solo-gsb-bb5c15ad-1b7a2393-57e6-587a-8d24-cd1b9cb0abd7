@@ -156,15 +156,17 @@ def adopted_timeline(
 
 
 def load_cargo_context(db, cargo_id: str):
-    """一次读齐货物的自有事件、装卸时段、相关车次车载读数、测温更正有效值与
-    生效探头故障隔离映射。
+    """一次读齐货物的自有事件、装卸时段、相关车次车载读数、测温更正有效值、
+    生效探头故障隔离映射与温度上限标准变更。
 
-    返回 ``(events, loadings, readings, effective, quarantine)``；
+    返回 ``(events, loadings, readings, effective, quarantine, limit_changes)``；
     ``effective`` 为 ``(event_effective, reading_effective)`` 两个映射，键分别
     为自有测温事件ID与车载读数ID，值为 ``(有效温度, 当前版本)``，只含发生过
     更正的目标；``quarantine`` 为车载读数ID -> 覆盖该读数的生效故障编号元组
     （仅含被该读数所属车次生效故障覆盖的读数；是否在车由合并阶段按装卸时段
-    再判定）。
+    再判定）；``limit_changes`` 为该货物分时生效温度上限标准的全部 append-only
+    变更行（初始上限仍取 cargo.temp_upper_limit，标准历程由
+    :func:`app.standards.build_limit_history` 组装）。
     """
     from sqlalchemy import select
 
@@ -221,7 +223,12 @@ def load_cargo_context(db, cargo_id: str):
         },
         reading_ids={r.reading_id for r in readings},
     )
-    return events, loadings, readings, effective, quarantine
+
+    # 温度上限标准变更（append-only；与其它证据同一次加载，保证重建一致视图）
+    from app import standards as standards_mod
+
+    limit_changes = standards_mod.load_limit_changes(db, cargo_id)
+    return events, loadings, readings, effective, quarantine, limit_changes
 
 
 def load_effective_maps(db, event_ids=None, reading_ids=None):

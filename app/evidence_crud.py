@@ -112,20 +112,21 @@ def _create_seal_tx(db, payload: EvidenceSealCreate) -> SealWriteResult:
 
         # 在持锁期间的最新一致视图上定位区间并组装证据：上下文只加载一次、
         # 重建只做一次——区间定位（含快照校验）与封存内容组装必须共用同一
-        # 份 (events, loadings, readings, effective, quarantine)，否则在两次
-        # 读取之间若有故障登记 / 撤销 / 更正提交，会得到“旧快照 + 新隔离
-        # 状态”的撕裂视图（PG 下货物行锁已串行；单次加载在读已提交下同样
-        # 消除该窗口）。
+        # 份 (events, loadings, readings, effective, quarantine,
+        # limit_changes)，否则在两次读取之间若有故障登记 / 撤销 / 更正 /
+        # 标准变更提交，会得到“旧快照 + 新隔离 / 新上限状态”的撕裂视图
+        # （PG 下货物行锁已串行；单次加载在读已提交下同样消除该窗口）。
         from app.chain import interval_id as _interval_id
         from app.timeline import load_cargo_context
         from app import responsibility as resp_mod
         from app import stance_crud
 
-        events, loadings, readings, effective, quarantine = load_cargo_context(
-            db, cargo_id
+        events, loadings, readings, effective, quarantine, limit_changes = (
+            load_cargo_context(db, cargo_id)
         )
         chain_result, closed_map = resp_mod.rebuild(
-            cargo, events, loadings, readings, effective, quarantine
+            cargo, events, loadings, readings, effective, quarantine,
+            limit_changes,
         )
         ex = closed_map.get(interval_key)
         if ex is None:
@@ -168,6 +169,7 @@ def _create_seal_tx(db, payload: EvidenceSealCreate) -> SealWriteResult:
             effective,
             sealed_at,
             reading_quarantine=quarantine,
+            limit_changes=limit_changes,
         )
 
         row = EvidenceSeal(

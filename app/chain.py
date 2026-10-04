@@ -169,15 +169,27 @@ def _sorted_events(items) -> list[TimelinePoint]:
 
 def rebuild_chain(
     initial_holder: str,
-    temp_upper_limit: Decimal,
+    temp_upper_limit,
     items: list,
 ) -> ChainResult:
     """按时间线重建当前保管方与全部越温区间（含责任片段）。
 
     ``items`` 可为自有 :class:`Event` 列表、:class:`TimelinePoint` 列表或二者混合。
     未被采用（``adopted=False``）的车载测温点不参与重建。
+
+    ``temp_upper_limit`` 可为固定上限（Decimal，兼容旧调用 / 单元测试）或
+    **阶梯上限函数** ``limit_at(t) -> Decimal``——货物温度上限标准支持
+    分时生效（见 :mod:`app.standards`）：每笔测温按其**当时生效的上限**
+    判定越温，恰在标准变更时刻的读数采用新上限（左闭边界）。
     """
-    limit = Decimal(temp_upper_limit)
+    if callable(temp_upper_limit):
+        limit_at = temp_upper_limit
+    else:
+        fixed_limit = Decimal(temp_upper_limit)
+
+        def limit_at(_at) -> Decimal:
+            return fixed_limit
+
     holder = initial_holder
 
     open_start = None                  # 当前越温区间起点
@@ -189,7 +201,7 @@ def rebuild_chain(
         if not p.adopted:
             continue
         if p.is_measurement:
-            over = Decimal(p.temperature) > limit
+            over = Decimal(p.temperature) > limit_at(p.occurred_at)
             if open_start is None and over:
                 # 开启越温：当前保管方自测温时刻起担责
                 open_start = p.occurred_at

@@ -302,3 +302,38 @@ CREATE TABLE IF NOT EXISTS probe_fault_revocation (
         expected_version >= 0 AND version = expected_version + 1
     )
 );
+
+-- 货物温度上限标准变更（append-only：分时生效，初始上限仍取 cargo.temp_upper_limit）。
+-- 质控人员凭变更编号、带时区生效时刻、期望标准版本、新上限与原因登记；初始上限
+-- 自货物起始时刻生效，每条变更自其生效时刻（左闭，边界读数采用新上限）起切换
+-- 上限，允许补录 / 预约，生效时刻不得早于货物起始时刻，同货物同刻仅一条。
+-- expected_version 为乐观锁（首次变更为 0），version 为变更后版本（= 期望值+1）。
+-- 变更不产生测温或交接；全部越温重建按每笔已采用读数当时生效的上限。
+CREATE TABLE IF NOT EXISTS temp_limit_change (
+    change_id        VARCHAR(64)   PRIMARY KEY,
+    cargo_id         VARCHAR(64)   NOT NULL
+                       REFERENCES cargo(cargo_id) ON DELETE RESTRICT,
+    effective_at     TIMESTAMPTZ   NOT NULL,
+    expected_version INTEGER       NOT NULL,
+    version          INTEGER       NOT NULL,
+    new_limit        NUMERIC(10,3) NOT NULL,
+    reason           VARCHAR(512)  NOT NULL,
+    created_at       TIMESTAMPTZ   NOT NULL DEFAULT now(),
+
+    CONSTRAINT chk_temp_limit_change_shape CHECK (
+        new_limit IS NOT NULL
+        AND expected_version >= 0
+        AND version >= 1
+    )
+);
+
+-- 同一货物同一生效时刻至多一条标准变更
+CREATE UNIQUE INDEX IF NOT EXISTS ux_temp_limit_change_cargo_time
+    ON temp_limit_change (cargo_id, effective_at);
+
+-- 每个货物下标准版本号唯一（应用侧在货物行锁内按序号分配）
+CREATE UNIQUE INDEX IF NOT EXISTS ux_temp_limit_change_cargo_version
+    ON temp_limit_change (cargo_id, version);
+
+CREATE INDEX IF NOT EXISTS ix_temp_limit_change_cargo
+    ON temp_limit_change (cargo_id, effective_at);

@@ -341,13 +341,15 @@ class PrecheckResult:
 def _manifest_context(db, trip_id: str, norm_items):
     """预检 / 确认共用的只读上下文。
 
-    返回 ``(existing_loadings, cargos, reading_infos)``：
+    返回 ``(existing_loadings, cargos, reading_infos, limit_histories)``：
 
     * ``existing_loadings``：该车次全部既有装卸时段（UTC 归一化）；
-    * ``cargos``：本批货物 ∪ 既有装卸货物 的编号 -> Cargo 行（温度上限即
-      “货物版本”指纹：上限变化会使预检摘要过期）；
+    * ``cargos``：本批货物 ∪ 既有装卸货物 的编号 -> Cargo 行；
     * ``reading_infos``：该车次全部既有车载读数的
-      :class:`app.precheck.ReadingInfo`（有效温度 + 更正版本）。
+      :class:`app.precheck.ReadingInfo`（有效温度 + 更正版本）；
+    * ``limit_histories``：涉及货物编号 -> **完整温度上限标准历程**
+      （初始上限 + 分时变更；货物标准版本指纹：任一标准变化都会使预检
+      摘要过期）。
     """
     loadings = get_loadings(db, trip_id)
     for l in loadings:
@@ -361,6 +363,8 @@ def _manifest_context(db, trip_id: str, norm_items):
             select(Cargo).where(Cargo.cargo_id.in_(sorted(cargo_ids) or [""]))
         ).all()
     }
+    for c in cargos.values():
+        c.started_at = ensure_utc(c.started_at)
 
     readings = get_readings(db, trip_id)
     _, reading_eff = timeline.load_effective_maps(
@@ -368,6 +372,7 @@ def _manifest_context(db, trip_id: str, norm_items):
     )
     # 本车次生效探头故障：被覆盖读数不参与实际重建，预检中标记供参考
     from app import faults as faults_mod
+    from app import standards as standards_mod
 
     active_faults = faults_mod.load_active_faults(db, {trip_id})
     reading_quarantine = faults_mod.reading_quarantine_map(
@@ -391,17 +396,26 @@ def _manifest_context(db, trip_id: str, norm_items):
                 covering_fault_ids=covers,
             )
         )
-    return loadings, cargos, reading_infos
+
+    limit_histories = {
+        cid: standards_mod.build_limit_history(
+            cargos[cid], standards_mod.load_limit_changes(db, cid)
+        )
+        for cid in cargos
+    }
+    return loadings, cargos, reading_infos, limit_histories
 
 
 def _current_manifest_digest(db, trip: Trip, norm_items) -> str:
     """按当前数据重算本批拟登记的预检摘要（确认时在持锁事务内调用）。"""
-    _, cargos, reading_infos = _manifest_context(db, trip.trip_id, norm_items)
+    _, _, reading_infos, limit_histories = _manifest_context(
+        db, trip.trip_id, norm_items
+    )
     return precheck.manifest_digest(
         trip.trip_id,
         trip.revision,
         norm_items,
-        {cid: Decimal(c.temp_upper_limit) for cid, c in cargos.items()},
+        limit_histories,
         reading_infos,
     )
 
@@ -480,7 +494,9 @@ def precheck_manifest(
         )
 
     # 5) 汇总上下文并计算分段分析 + 预检摘要
-    loadings, cargos, reading_infos = _manifest_context(db, trip_id, norm)
+    loadings, cargos, reading_infos, limit_histories = _manifest_context(
+        db, trip_id, norm
+    )
     windows = [
         precheck.BoardWindow(l.cargo_id, l.loaded_at, l.unloaded_at, False)
         for l in loadings
@@ -489,20 +505,24 @@ def precheck_manifest(
         for cargo_id, lo, un in norm
     ]
     segments = precheck.boarding_segments(windows)
+    # 分时上限：在涉及货物的标准变更时刻把分段切开（边界读数采用新上限）
+    segments = precheck.split_segments_at_standard_changes(
+        segments, limit_histories
+    )
     own_at = _own_measure_times(
         db, set(cargos), {r.read_at for r in reading_infos}
     )
     analyses = precheck.analyze_segments(
         segments,
         reading_infos,
-        {cid: Decimal(c.temp_upper_limit) for cid, c in cargos.items()},
+        limit_histories,
         own_at,
     )
     digest = precheck.manifest_digest(
         trip_id,
         trip.revision,
         norm,
-        {cid: Decimal(c.temp_upper_limit) for cid, c in cargos.items()},
+        limit_histories,
         reading_infos,
     )
     return PrecheckResult(
@@ -732,7 +752,7 @@ def query_simultaneous_excursions(db, trip_id: str, start_at, end_at, min_cargo:
             continue
         # 与货物报告同一套重建：必须含该货物**全部车次**的上下文——货物可能
         # 从上一车次带着未闭合越温区间装到本车次，此时自本车次装车时刻起即越温。
-        events, all_loadings, ctx_readings, effective, quarantine = (
+        events, all_loadings, ctx_readings, effective, quarantine, limit_changes = (
             timeline.load_cargo_context(db, cargo_id)
         )
         event_eff, reading_eff = effective
@@ -744,8 +764,12 @@ def query_simultaneous_excursions(db, trip_id: str, start_at, end_at, min_cargo:
             reading_eff,
             quarantine,
         )
+        # 分时温度上限：每笔已采用读数按其当时生效的上限判定
+        from app import standards as standards_mod
+
+        history = standards_mod.build_limit_history(cargo, limit_changes)
         result = chain.rebuild_chain(
-            cargo.initial_holder, Decimal(cargo.temp_upper_limit), points
+            cargo.initial_holder, standards_mod.limit_resolver(history), points
         )
         own_loadings = [l for l in all_loadings if l.trip_id == trip_id]
         windows = overlap.cargo_excursion_windows(

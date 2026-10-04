@@ -131,12 +131,24 @@ def test_seal_content_shape_and_digest(client):
 
     content = body["content"]
     assert content["case_id"] == "CASE-1"
-    assert content["cargo"] == {
-        "cargo_id": "C1",
-        "started_at": "2026-01-01T10:00:00Z",
-        "temp_upper_limit": "5.000",
-        "initial_holder": "A",
-    }
+    assert content["cargo"]["cargo_id"] == "C1"
+    assert content["cargo"]["started_at"] == "2026-01-01T10:00:00Z"
+    assert content["cargo"]["temp_upper_limit"] == "5.000"
+    assert content["cargo"]["initial_holder"] == "A"
+    # 温度上限标准历程：无变更时仅初始条目（version=0）
+    assert content["cargo"]["standard_version"] == 0
+    assert content["cargo"]["temp_limit_standards"] == [
+        {
+            "effective_at": "2026-01-01T10:00:00Z",
+            "temp_upper_limit": "5.000",
+            "version": 0,
+            "source": "initial",
+            "change_id": None,
+            "expected_version": None,
+            "reason": None,
+            "created_at": None,
+        }
+    ]
     interval = content["interval"]
     assert interval["interval_id"] == iid == "m1"
     assert interval["start"] == "2026-01-01T10:10:00Z"
@@ -162,10 +174,13 @@ def test_seal_content_shape_and_digest(client):
     assert m1_item["temperature"] == "8.000"
     assert m1_item["effective_temperature"] == "8.000"
     assert m1_item["version"] == 0
+    # 每笔测温记录其当时生效的温度上限（无标准变更即初始上限）
+    assert m1_item["temp_upper_limit"] == "5.000"
     h_item = next(e for e in content["own_events"] if e["event_id"] == "h1")
     assert h_item["event_type"] == "handover"
     assert h_item["temperature"] is None
     assert h_item["effective_temperature"] is None
+    assert h_item["temp_upper_limit"] is None
 
     # 无车次：读数 / 窗口为空
     assert content["vehicle_readings"] == []

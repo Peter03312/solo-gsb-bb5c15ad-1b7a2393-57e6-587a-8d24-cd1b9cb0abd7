@@ -915,3 +915,150 @@ import json,sys
 d = json.load(sys.stdin)
 r = next(x for x in d["content"]["vehicle_readings"] if x["reading_id"] == "sq-vr-q")
 print("    原包不改: quarantined =", r["quarantined"], "covering =", r["covering_fault_ids"])'
+
+echo "================ 本轮新增：货物分时生效温度上限 ================"
+
+TL="COLD-TL-1"
+echo "73) 创建货物（初始上限 5℃ 自起始时刻生效）"
+curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"$TL\",
+  \"started_at\": \"2026-10-04T08:00:00+08:00\",
+  \"temp_upper_limit\": \"5.0\",
+  \"initial_holder\": \"北京冷库\"
+}" | python3 -m json.tool
+
+echo "74) 查询完整标准历程与当前版本（初始条目 version=0）"
+curl -sS "$BASE/cargo/$TL/temp-limits" | python3 -m json.tool
+
+echo "75) 预约变更：2026-10-05 00:00（+08:00）起上限收紧为 4℃，expected_version=0"
+curl -sS -X POST "$BASE/cargo/$TL/temp-limits" -H 'Content-Type: application/json' -d "{
+  \"change_id\": \"tl-chg-1\",
+  \"effective_at\": \"2026-10-05T00:00:00+08:00\",
+  \"new_limit\": \"4.0\",
+  \"expected_version\": 0,
+  \"reason\": \"冬季温控要求收紧\"
+}" | python3 -m json.tool
+
+echo "76) 同编号同请求重传 -> 200 replayed（返回原结果）；异内容 -> 409 limit_change_id_conflict"
+curl -sS -o /dev/null -w '    重传状态码 = %{http_code}\n' -X POST "$BASE/cargo/$TL/temp-limits" \
+  -H 'Content-Type: application/json' -d "{
+  \"change_id\": \"tl-chg-1\",
+  \"effective_at\": \"2026-10-05T00:00:00+08:00\",
+  \"new_limit\": \"4.0\",
+  \"expected_version\": 0,
+  \"reason\": \"冬季温控要求收紧\"
+}"
+curl -sS -o /dev/null -w '    异内容状态码 = %{http_code}\n' -X POST "$BASE/cargo/$TL/temp-limits" \
+  -H 'Content-Type: application/json' -d "{
+  \"change_id\": \"tl-chg-1\",
+  \"effective_at\": \"2026-10-06T00:00:00+08:00\",
+  \"new_limit\": \"3.0\",
+  \"expected_version\": 0,
+  \"reason\": \"冲突请求\"
+}"
+
+echo "77) 边界读数采用新上限：10-04 23:30 测温 4.5℃（旧上限 5 不越温）；10-05 00:00 恰在生效时刻 4.5℃（新上限 4 越温）"
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"tl-m-before\", \"cargo_id\": \"$TL\",
+  \"occurred_at\": \"2026-10-04T23:30:00+08:00\", \"temperature\": \"4.5\"
+}" >/dev/null
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"tl-m-boundary\", \"cargo_id\": \"$TL\",
+  \"occurred_at\": \"2026-10-05T00:00:00+08:00\", \"temperature\": \"4.5\"
+}" >/dev/null
+curl -sS -X POST "$BASE/events" -H 'Content-Type: application/json' -d "{
+  \"event_id\": \"tl-m-close\", \"cargo_id\": \"$TL\",
+  \"occurred_at\": \"2026-10-05T01:00:00+08:00\", \"temperature\": \"4.0\"
+}" >/dev/null
+curl -sS "$BASE/cargo/$TL/report" | python3 -c '
+import json,sys
+r = json.load(sys.stdin)
+print("    标准版本 =", r["standard_version"])
+for e in r["excursions"]:
+    print("    越温区间:", e["start"], "->", e["end"], "（开启读数", e["interval_id"], "）")'
+
+echo "78) 期望版本过期（当前为 1 仍传 0）-> 409 stale_standard_version；补传正确版本成功"
+curl -sS -o /dev/null -w '    stale -> %{http_code}\n' -X POST "$BASE/cargo/$TL/temp-limits" \
+  -H 'Content-Type: application/json' -d "{
+  \"change_id\": \"tl-chg-bad\",
+  \"effective_at\": \"2026-10-06T00:00:00+08:00\",
+  \"new_limit\": \"3.0\",
+  \"expected_version\": 0,
+  \"reason\": \"过期版本\"
+}"
+curl -sS -X POST "$BASE/cargo/$TL/temp-limits" -H 'Content-Type: application/json' -d "{
+  \"change_id\": \"tl-chg-2\",
+  \"effective_at\": \"2026-10-06T00:00:00+08:00\",
+  \"new_limit\": \"3.0\",
+  \"expected_version\": 1,
+  \"reason\": \"进一步收紧\"
+}" | python3 -c 'import json,sys; print("    当前标准版本 =", json.load(sys.stdin)["version"])'
+
+echo "79) 拒绝场景：生效时刻早于货物起始 422 before_start / 缺时区 422 timezone_required / 同刻冲突 409"
+curl -sS -o /dev/null -w '    before_start -> %{http_code}\n' -X POST "$BASE/cargo/$TL/temp-limits" \
+  -H 'Content-Type: application/json' -d "{
+  \"change_id\": \"tl-chg-early\",
+  \"effective_at\": \"2026-10-04T07:59:00+08:00\",
+  \"new_limit\": \"4.0\", \"expected_version\": 2, \"reason\": \"早于起始\"
+}"
+curl -sS -o /dev/null -w '    timezone_required -> %{http_code}\n' -X POST "$BASE/cargo/$TL/temp-limits" \
+  -H 'Content-Type: application/json' -d "{
+  \"change_id\": \"tl-chg-nt\",
+  \"effective_at\": \"2026-10-07T00:00:00\",
+  \"new_limit\": \"4.0\", \"expected_version\": 2, \"reason\": \"无时区\"
+}"
+curl -sS -o /dev/null -w '    same_timestamp_conflict -> %{http_code}\n' -X POST "$BASE/cargo/$TL/temp-limits" \
+  -H 'Content-Type: application/json' -d "{
+  \"change_id\": \"tl-chg-dup\",
+  \"effective_at\": \"2026-10-06T00:00:00+08:00\",
+  \"new_limit\": \"2.0\", \"expected_version\": 2, \"reason\": \"同刻冲突\"
+}"
+
+echo "80) 补录变更（早于当前时刻）后越温按各读数当时上限重建；时间线逐点给出当时上限"
+curl -sS -X POST "$BASE/cargo/$TL/temp-limits" -H 'Content-Type: application/json' -d "{
+  \"change_id\": \"tl-chg-back\",
+  \"effective_at\": \"2026-10-04T08:00:00+08:00\",
+  \"new_limit\": \"4.0\",
+  \"expected_version\": 2,
+  \"reason\": \"起始即执行更严标准（补录）\"
+}" | python3 -c 'import json,sys; print("    补录后标准版本 =", json.load(sys.stdin)["version"])'
+curl -sS "$BASE/cargo/$TL/timeline" | python3 -c '
+import json,sys
+for p in json.load(sys.stdin)["points"]:
+    if p["point_type"] == "measurement":
+        print("    ", p["occurred_at"], p["temperature"], "℃ / 当时上限", p["temp_upper_limit"])'
+
+echo "81) 装前预检在标准变更时刻分段：拟装货物 $TL 与既有货物同车（先登记车次/既有货物）"
+curl -sS -X POST "$BASE/trips" -H 'Content-Type: application/json' -d "{
+  \"trip_id\": \"TRUCK-TL\", \"vehicle_no\": \"京B-TL\"
+}" >/dev/null
+curl -sS -X POST "$BASE/cargo" -H 'Content-Type: application/json' -d "{
+  \"cargo_id\": \"COLD-TL-2\",
+  \"started_at\": \"2026-10-04T08:00:00+08:00\",
+  \"temp_upper_limit\": \"8.0\",
+  \"initial_holder\": \"北京冷库\"
+}" >/dev/null
+curl -sS -X POST "$BASE/trips/TRUCK-TL/manifest" -H 'Content-Type: application/json' -d "{
+  \"items\": [{
+    \"cargo_id\": \"COLD-TL-2\",
+    \"loaded_at\": \"2026-10-04T20:00:00+08:00\",
+    \"unloaded_at\": \"2026-10-06T20:00:00+08:00\"
+  }]
+}" >/dev/null
+TREV_TL=$(curl -sS "$BASE/trips/TRUCK-TL" | python3 -c 'import json,sys; print(json.load(sys.stdin)["revision"])')
+curl -sS -X POST "$BASE/trips/TRUCK-TL/manifest/precheck" -H 'Content-Type: application/json' -d "{
+  \"expected_trip_revision\": $TREV_TL,
+  \"items\": [{
+    \"cargo_id\": \"$TL\",
+    \"loaded_at\": \"2026-10-04T20:00:00+08:00\",
+    \"unloaded_at\": \"2026-10-06T20:00:00+08:00\"
+  }]
+}" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+print("    预检摘要 =", d["digest"])
+for s in d["segments"]:
+    print("    分段", s["start"], "->", s["end"], "上限", s["temp_limit_min"], "~", s["temp_limit_max"])'
+echo "    （标准变更使预检摘要绑定完整标准历程；变更后用旧摘要确认将被 409 stale_precheck_digest 拒绝）"
+
+echo "完成。"
